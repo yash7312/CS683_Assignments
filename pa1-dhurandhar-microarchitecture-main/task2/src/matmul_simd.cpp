@@ -2,10 +2,94 @@
 
 #include "matmul.h"
 
+#ifndef SIMD_WIDTH
+#define SIMD_WIDTH 256
+#endif
+
 namespace {
 
 constexpr int MR = 4;
 constexpr int NR = 3;
+
+#if SIMD_WIDTH == 128
+
+inline float hsum(__m128 v) {
+    v = _mm_add_ps(v, _mm_movehl_ps(v, v));
+    v = _mm_add_ss(v, _mm_shuffle_ps(v, v, 1));
+    return _mm_cvtss_f32(v);
+}
+
+inline float dot(const float* a, const float* b, int K) {
+    __m128 acc = _mm_setzero_ps();
+    int p = 0;
+    for (; p + 4 <= K; p += 4)
+        acc = _mm_add_ps(acc, _mm_mul_ps(_mm_loadu_ps(a + p), _mm_loadu_ps(b + p)));
+    float sum = hsum(acc);
+    for (; p < K; ++p) sum += a[p] * b[p];
+    return sum;
+}
+
+inline void tile_4x3(const float* A, const float* B, float* C,
+                     int K, int lda, int ldb, int ldc) {
+    const float* a0 = A;
+    const float* a1 = A + lda;
+    const float* a2 = A + 2 * lda;
+    const float* a3 = A + 3 * lda;
+    const float* b0 = B;
+    const float* b1 = B + ldb;
+    const float* b2 = B + 2 * ldb;
+
+    __m128 c00 = _mm_setzero_ps(), c01 = _mm_setzero_ps(), c02 = _mm_setzero_ps();
+    __m128 c10 = _mm_setzero_ps(), c11 = _mm_setzero_ps(), c12 = _mm_setzero_ps();
+    __m128 c20 = _mm_setzero_ps(), c21 = _mm_setzero_ps(), c22 = _mm_setzero_ps();
+    __m128 c30 = _mm_setzero_ps(), c31 = _mm_setzero_ps(), c32 = _mm_setzero_ps();
+
+    int p = 0;
+    for (; p + 4 <= K; p += 4) {
+        const __m128 vb0 = _mm_loadu_ps(b0 + p);
+        const __m128 vb1 = _mm_loadu_ps(b1 + p);
+        const __m128 vb2 = _mm_loadu_ps(b2 + p);
+
+        __m128 va = _mm_loadu_ps(a0 + p);
+        c00 = _mm_add_ps(c00, _mm_mul_ps(va, vb0));
+        c01 = _mm_add_ps(c01, _mm_mul_ps(va, vb1));
+        c02 = _mm_add_ps(c02, _mm_mul_ps(va, vb2));
+
+        va = _mm_loadu_ps(a1 + p);
+        c10 = _mm_add_ps(c10, _mm_mul_ps(va, vb0));
+        c11 = _mm_add_ps(c11, _mm_mul_ps(va, vb1));
+        c12 = _mm_add_ps(c12, _mm_mul_ps(va, vb2));
+
+        va = _mm_loadu_ps(a2 + p);
+        c20 = _mm_add_ps(c20, _mm_mul_ps(va, vb0));
+        c21 = _mm_add_ps(c21, _mm_mul_ps(va, vb1));
+        c22 = _mm_add_ps(c22, _mm_mul_ps(va, vb2));
+
+        va = _mm_loadu_ps(a3 + p);
+        c30 = _mm_add_ps(c30, _mm_mul_ps(va, vb0));
+        c31 = _mm_add_ps(c31, _mm_mul_ps(va, vb1));
+        c32 = _mm_add_ps(c32, _mm_mul_ps(va, vb2));
+    }
+
+    float s00 = hsum(c00), s01 = hsum(c01), s02 = hsum(c02);
+    float s10 = hsum(c10), s11 = hsum(c11), s12 = hsum(c12);
+    float s20 = hsum(c20), s21 = hsum(c21), s22 = hsum(c22);
+    float s30 = hsum(c30), s31 = hsum(c31), s32 = hsum(c32);
+
+    for (; p < K; ++p) {
+        s00 += a0[p] * b0[p]; s01 += a0[p] * b1[p]; s02 += a0[p] * b2[p];
+        s10 += a1[p] * b0[p]; s11 += a1[p] * b1[p]; s12 += a1[p] * b2[p];
+        s20 += a2[p] * b0[p]; s21 += a2[p] * b1[p]; s22 += a2[p] * b2[p];
+        s30 += a3[p] * b0[p]; s31 += a3[p] * b1[p]; s32 += a3[p] * b2[p];
+    }
+
+    C[0] = s00;           C[1] = s01;           C[2] = s02;
+    C[ldc] = s10;         C[ldc + 1] = s11;     C[ldc + 2] = s12;
+    C[2 * ldc] = s20;     C[2 * ldc + 1] = s21; C[2 * ldc + 2] = s22;
+    C[3 * ldc] = s30;     C[3 * ldc + 1] = s31; C[3 * ldc + 2] = s32;
+}
+
+#else
 
 inline float hsum(__m256 v) {
     __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
@@ -83,6 +167,8 @@ inline void tile_4x3(const float* A, const float* B, float* C,
     C[2 * ldc] = s20;     C[2 * ldc + 1] = s21; C[2 * ldc + 2] = s22;
     C[3 * ldc] = s30;     C[3 * ldc + 1] = s31; C[3 * ldc + 2] = s32;
 }
+
+#endif
 
 }
 
