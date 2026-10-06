@@ -5,8 +5,12 @@
 #define PREFETCH_DEGREE 3
 #define MASK_IP 0xFF
 
-const int fixed_pattern[]={1,2,2,3};
-const int pattern_length = 4;
+// dynamic pattern tracking
+#define PHT_SIZE 4096 // 12-bit signature space
+#define STRIDE_MASK 0xF // 4 bits per stride
+#define SIG_MASK 0xFFF // 12 bits total (3 strides)
+
+int64_t PHT[PHT_SIZE];
 
 class SPP_TRACKER{
   public:
@@ -23,7 +27,8 @@ class SPP_TRACKER{
     uint32_t lru;
 
     int uniform_conf;
-    int pattern_index;
+    
+    uint32_t signature;
 
     SPP_TRACKER () {
         ip = 0;
@@ -31,7 +36,7 @@ class SPP_TRACKER{
         last_stride = 0;
         lru = 0;
         uniform_conf=0;
-        pattern_index=0;
+        signature=0;
     };
 };
 
@@ -45,6 +50,9 @@ void CACHE::l1d_prefetcher_initialize()
 
     for(int i=0; i<SPP_TRACKER_COUNT; i++){
         trackers[i].lru=i;
+    }
+    for(int i=0; i<SPP_TRACKER_COUNT; i++){
+        PHT[i]=0;
     }
 }
 
@@ -71,7 +79,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         trackers[index].last_cl_addr = cl_addr;
         trackers[index].last_stride = 0;
         trackers[index].uniform_conf = 0;
-        trackers[index].pattern_index = 0;
+        trackers[index].signature = 0;
 
     	for (int i=0; i<SPP_TRACKER_COUNT; i++) {
             if (trackers[i].lru < trackers[index].lru)
@@ -95,6 +103,13 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     // don't do anything if we somehow saw the same address twice in a row
     if (stride == 0)
         return;	//metadata_in;
+
+    // 1. Train the PHT: The previous signature led to THIS current stride
+    PHT[trackers[index].signature]=stride;
+
+    // 2. Update the IP's signature with the current stride
+    // Shift left by 4 bits, insert the new 4-bit stride, and mask to 12 bits
+    trackers[index].signature = ((trackers[index].signature<<4) | (stride & STRIDE_MASK)) & SIG_MASK;
 
     // unifrom conf calc
     if (stride == trackers[index].last_stride) {
@@ -123,13 +138,21 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     // Non-uniform case handling
     else {
         uint64_t current_pf_cl = cl_addr;
-        int temp_idx = trackers[index].pattern_index;
+        // int temp_idx = trackers[index].pattern_index;
+        uint32_t speculative_sig = trackers[index].signature;
 
 
         for(int i=0; i<PREFETCH_DEGREE; i++){
-            current_pf_cl +=fixed_pattern[temp_idx];
-            uint64_t pf_address = current_pf_cl << LOG2_BLOCK_SIZE;
+            int64_t predicted_stride = PHT[speculative_sig];
+
+            if(predicted_stride==0) 
+                break;
             
+            // current_pf_cl +=fixed_pattern[temp_idx];
+            current_pf_cl += predicted_stride;
+
+            uint64_t pf_address = current_pf_cl << LOG2_BLOCK_SIZE;
+
             if((pf_address>>LOG2_PAGE_SIZE) != (addr>>LOG2_PAGE_SIZE))
                 break;
             
@@ -138,10 +161,11 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             else
               prefetch_line(ip, addr, pf_address, FILL_L2, 0);
 
-            temp_idx = (temp_idx+1) % pattern_length;
+            // temp_idx = (temp_idx+1) % pattern_length;
+            speculative_sig = ((speculative_sig<<4) | (predicted_stride & STRIDE_MASK)) & SIG_MASK;
         }
 
-        trackers[index].pattern_index = (trackers[index].pattern_index + 1) %  pattern_length;
+        // trackers[index].pattern_index = (trackers[index].pattern_index + 1) %  pattern_length;
     }
 
     trackers[index].last_cl_addr = cl_addr;
