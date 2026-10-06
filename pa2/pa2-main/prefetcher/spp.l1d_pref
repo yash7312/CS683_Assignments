@@ -10,7 +10,17 @@
 #define STRIDE_MASK 0xF // 4 bits per stride
 #define SIG_MASK 0xFFF // 12 bits total (3 strides)
 
+// Accuracy Throttling Parameters
+#define EVAL_INTERVAL 1000 // Evaluate accuracy every 1000 demand requests
+
 int64_t PHT[PHT_SIZE];
+
+int current_degree = 3;
+
+// Global counters for accuracy calculation
+uint64_t total_issued_prefetches = 0;
+uint64_t total_useful_prefetches = 0;
+uint64_t access_counter = 0;
 
 class SPP_TRACKER{
   public:
@@ -27,7 +37,6 @@ class SPP_TRACKER{
     uint32_t lru;
 
     int uniform_conf;
-    
     uint32_t signature;
 
     SPP_TRACKER () {
@@ -51,13 +60,41 @@ void CACHE::l1d_prefetcher_initialize()
     for(int i=0; i<SPP_TRACKER_COUNT; i++){
         trackers[i].lru=i;
     }
-    for(int i=0; i<SPP_TRACKER_COUNT; i++){
+    for(int i=0; i<PHT_SIZE; i++){
         PHT[i]=0;
     }
+
+    current_degree = 3;
+    total_issued_prefetches = 0;
+    total_useful_prefetches = 0;
+    access_counter = 0;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
+    access_counter++;
+
+    // Periodically evaluate prefetch accuracy and adjust degree
+    if (access_counter >= EVAL_INTERVAL) {
+        if (total_issued_prefetches > 0) {
+            float accuracy = (float)total_useful_prefetches / total_issued_prefetches;
+
+            // Accuracy Threshold Logic
+            if (accuracy >= 0.50) {
+                current_degree = 3; // High accuracy: full aggressiveness
+            } else if (accuracy >= 0.25) {
+                current_degree = 2; // Moderate accuracy: moderate degree
+            } else {
+                current_degree = 1; // Low accuracy: conservative degree
+            }
+        }
+
+        // Reset epoch counters
+        total_issued_prefetches = 0;
+        total_useful_prefetches = 0;
+        access_counter = 0;
+    }
+
     // check for a tracker hit
     uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
     ip = ip & MASK_IP;
@@ -120,7 +157,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
     if(trackers[index].uniform_conf>0){
         // do some prefetching
-        for (int i=0; i<PREFETCH_DEGREE; i++) {
+        for (int i=0; i<current_degree; i++) {
             uint64_t pf_address = (cl_addr + (trackers[index].last_stride*(i+1))) << LOG2_BLOCK_SIZE;
 
             // only issue a prefetch if the prefetch address is in the same 4 KB page
@@ -133,6 +170,8 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
               prefetch_line(ip, addr, pf_address, FILL_L1, 0);
             else
               prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+
+            total_issued_prefetches++; // Track issued prefetch 
         }
     }
     // Non-uniform case handling
@@ -142,7 +181,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         uint32_t speculative_sig = trackers[index].signature;
 
 
-        for(int i=0; i<PREFETCH_DEGREE; i++){
+        for(int i=0; i<current_degree; i++){
             int64_t predicted_stride = PHT[speculative_sig];
 
             if(predicted_stride==0) 
@@ -161,11 +200,10 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
             else
               prefetch_line(ip, addr, pf_address, FILL_L2, 0);
 
-            // temp_idx = (temp_idx+1) % pattern_length;
+            total_issued_prefetches++; // Track issued prefetch
+
             speculative_sig = ((speculative_sig<<4) | (predicted_stride & STRIDE_MASK)) & SIG_MASK;
         }
-
-        // trackers[index].pattern_index = (trackers[index].pattern_index + 1) %  pattern_length;
     }
 
     trackers[index].last_cl_addr = cl_addr;
@@ -181,12 +219,15 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-	return; //metadata_in;
+	// adding metadata for accuracy based throttling
+    if (prefetch == 1) {
+        total_useful_prefetches++;
+    }
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
     std::cout << "------------------------------------------------" << std::endl;
-    std::cout << " Degree: " << PREFETCH_DEGREE << std::endl;
+    std::cout << " Final dynamic Degree: " << current_degree << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
 }
