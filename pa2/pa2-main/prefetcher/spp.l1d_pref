@@ -1,405 +1,168 @@
 #include "cache.h"
-#include <cstring>
+#include <iostream>
 
-/* ==================================================================================
-   DUAL-MODE (UNIFORM + NON-UNIFORM) IP-STRIDE L1D PREFETCHER
-   ------------------------------------------------------------------------------
-   Every #define below is a CONFIGURABLE knob. Nothing else in this file needs
-   to change to retune capacity, sensitivity, or aggressiveness -- flip a
-   number here and the rest of the logic adapts automatically.
+#define SPP_TRACKER_COUNT 24
+#define PREFETCH_DEGREE 3
+#define MASK_IP 0xFF
 
-   Requirement -> code-section map (see inline [REQ-n] / [HINT-n] tags below):
-     [REQ-1] IP-indexed tracking table                  -> class IPTracker, trackers[]
-     [REQ-2] Dual pattern classification                 -> uniform_conf + Pattern Table (PT)
-     [REQ-3] Uniform prioritized, dynamic fallback        -> arbitration block in operate()
-     [REQ-4] Signature -> next-stride mapping             -> compute_signature() / PT
-     [REQ-5] Degree > 1                                   -> issuance loops (both modes)
-     [HINT-1] Confidence counters / state transition       -> uniform_conf, PT confidence
-     [HINT-2] Issued/useful counters, dynamic degree       -> pf_filter[] + maybe_adjust_degree()
-     [HINT-3] Stay within the same page                    -> page check in both issuance loops
-     [HINT-4] Lightweight / minimal storage                -> small fixed tables, no per-IP PT copy
-   ================================================================================== */
+const int fixed_pattern[]={1,2,2,3};
+const int pattern_length = 4;
 
-/* ---------------- [CONFIG] IP tracker table (per-IP history) ---------------- */
-#define IP_TRACKER_COUNT        32      // CONFIGURABLE: number of tracked IPs (storage vs coverage)
-#define IP_MASK                 0xFFF   // CONFIGURABLE: bits of IP kept as tracker identity (storage vs aliasing)
-
-/* ---------------- [CONFIG] Uniform (constant-stride) detector --------------- */
-#define UNIFORM_CONF_MAX         3      // CONFIGURABLE: saturating-counter ceiling
-#define UNIFORM_CONF_INC         1      // CONFIGURABLE: bump on a repeated (matching) stride
-#define UNIFORM_CONF_DEC         1      // CONFIGURABLE: decay (not hard reset) on a stride mismatch
-#define UNIFORM_CONF_THRESH      2      // CONFIGURABLE: confidence required before uniform mode is trusted
-
-/* ---------------- [CONFIG] Non-uniform (signature) detector ----------------- */
-#define SIG_HIST_LEN             3      // CONFIGURABLE: window depth W (#recent deltas forming a signature)
-#define SIG_DELTA_BITS           6      // CONFIGURABLE: bits used to encode each delta inside the signature
-#define PT_SIZE                  64     // CONFIGURABLE: shared Pattern Table entries (must stay a power of 2)
-#define PT_TAG_BITS              8      // CONFIGURABLE: tag width kept per PT entry (collision/aliasing check)
-#define PT_CONF_MAX              3      // CONFIGURABLE: saturating-counter ceiling for PT entries
-#define PT_CONF_INC              1      // CONFIGURABLE: bump on a correct prediction
-#define PT_CONF_DEC              1      // CONFIGURABLE: decay on a wrong prediction
-#define NONUNIFORM_CONF_THRESH   2      // CONFIGURABLE: PT confidence required before non-uniform mode is trusted
-
-/* ---------------- [CONFIG] Prefetch degree (uniform + chained non-uniform) -- */
-#define BASE_PREFETCH_DEGREE     2      // CONFIGURABLE: starting/default degree
-#define MIN_PREFETCH_DEGREE      1      // CONFIGURABLE: floor for the adaptive degree
-#define MAX_PREFETCH_DEGREE      4      // CONFIGURABLE: ceiling for the adaptive degree
-#define CHAIN_CONF_STEP          1      // CONFIGURABLE: extra PT confidence required per extra chained hop
-                                         //   (hop i needs conf >= NONUNIFORM_CONF_THRESH + i*CHAIN_CONF_STEP,
-                                         //    so weakly-supported far-ahead hops are pruned automatically)
-
-/* ---------------- [CONFIG] Usefulness tracking / dynamic degree ------------- */
-#define PF_TRACK_SIZE            64     // CONFIGURABLE: "recently prefetched" filter size (power of 2)
-#define ACC_EVAL_WINDOW          32     // CONFIGURABLE: #prefetches issued between degree re-evaluations
-#define ACC_HIGH_PCT             75     // CONFIGURABLE: accuracy% above which degree is increased
-#define ACC_LOW_PCT              40     // CONFIGURABLE: accuracy% below which degree is decreased
-
-/* ================================================================================== */
-
-enum PredMode : uint8_t { MODE_TRAINING = 0, MODE_UNIFORM = 1, MODE_NONUNIFORM = 2 };
-
-// [REQ-1] Per-IP tracker: constant-stride history + short delta window for the signature
-class IPTracker {
+class SPP_TRACKER{
   public:
+    // the IP we're tracking
     uint64_t ip;
+
+    // the last address accessed by this IP
     uint64_t last_cl_addr;
-    int64_t  last_stride;
-    uint8_t  uniform_conf;               // [HINT-1] confidence that this IP is currently uniform
-    int8_t   delta_hist[SIG_HIST_LEN];   // rolling window of the last W strides (for the signature)
-    uint8_t  hist_count;                 // how many of delta_hist[] are valid so far
+
+    // the stride between the last two addresses accessed by this IP
+    int64_t last_stride;
+
+    // use LRU to evict old IP trackers
     uint32_t lru;
-    bool     valid;
 
-    IPTracker() { reset(); }
-    void reset() {
-        ip = 0; last_cl_addr = 0; last_stride = 0;
-        uniform_conf = 0; hist_count = 0; lru = 0; valid = false;
-        memset(delta_hist, 0, sizeof(delta_hist));
-    }
+    int uniform_conf;
+    int pattern_index;
+
+    SPP_TRACKER () {
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        lru = 0;
+        uniform_conf=0;
+        pattern_index=0;
+    };
 };
 
-// [REQ-4] Shared Pattern Table entry: signature -> predicted next delta
-class PTEntry {
-  public:
-    bool     valid;
-    uint16_t tag;
-    int8_t   predicted_delta;
-    uint8_t  confidence;                 // [HINT-1]
-    PTEntry() : valid(false), tag(0), predicted_delta(0), confidence(0) {}
-};
+SPP_TRACKER trackers[SPP_TRACKER_COUNT];
 
-static IPTracker trackers[IP_TRACKER_COUNT];   // [REQ-1] / [HINT-4]: fixed, small, no per-IP PT copy
-static PTEntry   pattern_table[PT_SIZE];       // [REQ-4] shared across all IPs, kept lightweight
-
-// [HINT-2] tiny "did we prefetch this line" filter used to measure usefulness
-struct PFFilterEntry { bool valid; uint64_t tag; };
-static PFFilterEntry pf_filter[PF_TRACK_SIZE];
-
-// [HINT-2] global accuracy bookkeeping + adaptive degree
-static uint64_t total_prefetches_issued = 0;
-static uint64_t useful_prefetches       = 0;
-static uint64_t issued_since_eval       = 0;
-static int      current_degree          = BASE_PREFETCH_DEGREE;
-
-/* ---------------------------------- helpers ---------------------------------- */
-
-// Safe signed stride between two unsigned cache-line addresses (avoids unsigned wraparound)
-static int64_t compute_stride(uint64_t cur_cl, uint64_t prev_cl)
-{
-    if (cur_cl >= prev_cl) return (int64_t)(cur_cl - prev_cl);
-    return -(int64_t)(prev_cl - cur_cl);
-}
-
-static int find_tracker(uint64_t ip)
-{
-    for (int i = 0; i < IP_TRACKER_COUNT; i++)
-        if (trackers[i].valid && trackers[i].ip == ip) return i;
-    return -1;
-}
-
-static void touch_lru(int idx)
-{
-    for (int i = 0; i < IP_TRACKER_COUNT; i++)
-        if (trackers[i].lru < trackers[idx].lru) trackers[i].lru++;
-    trackers[idx].lru = 0;
-}
-
-static int allocate_tracker(uint64_t ip, uint64_t cl_addr)
-{
-    int victim = 0;
-    for (int i = 0; i < IP_TRACKER_COUNT; i++)
-        if (trackers[i].lru == (uint32_t)(IP_TRACKER_COUNT - 1)) { victim = i; break; }
-
-    trackers[victim].reset();
-    trackers[victim].ip = ip;
-    trackers[victim].last_cl_addr = cl_addr;
-    trackers[victim].valid = true;
-    touch_lru(victim);
-    return victim;
-}
-
-// [REQ-4] Fold the last W deltas (+ a few IP bits, to keep unrelated IPs from
-// aliasing into the same PT entry) into a single signature key.
-static uint32_t compute_signature(uint64_t ip, const int8_t *hist, uint8_t len)
-{
-    uint32_t sig = 0;
-    for (int i = 0; i < len; i++) {
-        uint32_t enc = (uint32_t)(uint8_t)hist[i] & ((1u << SIG_DELTA_BITS) - 1);
-        sig = (sig << SIG_DELTA_BITS) | enc;
-    }
-    sig ^= (uint32_t)(ip & 0x3F) << 3;   // cheap XOR-fold; swap for a stronger hash if PT_SIZE grows a lot
-    return sig;
-}
-
-static inline uint32_t pt_index(uint32_t sig) { return sig & (PT_SIZE - 1); }
-static inline uint16_t pt_tag(uint32_t sig)   { return (uint16_t)((sig >> 5) & ((1u << PT_TAG_BITS) - 1)); }
-
-static bool pt_lookup(uint32_t sig, int8_t &pred_delta, uint8_t &conf)
-{
-    PTEntry &e = pattern_table[pt_index(sig)];
-    if (e.valid && e.tag == pt_tag(sig)) {
-        pred_delta = e.predicted_delta;
-        conf = e.confidence;
-        return true;
-    }
-    return false;
-}
-
-// [HINT-1] Train the PT: 'sig' is the signature that was in effect BEFORE this
-// access; 'actual_delta' is the stride that really happened next.
-static void pt_train(uint32_t sig, int8_t actual_delta)
-{
-    PTEntry &e = pattern_table[pt_index(sig)];
-    uint16_t tag = pt_tag(sig);
-
-    if (!e.valid || e.tag != tag) {
-        // cold entry, or a different signature collided into this slot -> (re)install
-        e.valid = true;
-        e.tag = tag;
-        e.predicted_delta = actual_delta;
-        e.confidence = 1;
-        return;
-    }
-
-    if (e.predicted_delta == actual_delta)
-        e.confidence = (e.confidence < PT_CONF_MAX) ? e.confidence + PT_CONF_INC : PT_CONF_MAX;
-    else {
-        e.confidence = (e.confidence > PT_CONF_DEC) ? e.confidence - PT_CONF_DEC : 0;
-        if (e.confidence == 0)
-            e.predicted_delta = actual_delta;   // pattern changed -> relearn
-    }
-}
-
-static inline void pf_filter_mark(uint64_t cl_addr)
-{
-    PFFilterEntry &f = pf_filter[cl_addr & (PF_TRACK_SIZE - 1)];
-    f.valid = true;
-    f.tag = cl_addr;
-}
-
-// [HINT-2] Called on every demand access. Returns true (and clears the slot)
-// if this line was previously prefetched by us and is now actually being used.
-static inline bool pf_filter_check_and_clear(uint64_t cl_addr)
-{
-    PFFilterEntry &f = pf_filter[cl_addr & (PF_TRACK_SIZE - 1)];
-    if (f.valid && f.tag == cl_addr) {
-        f.valid = false;
-        return true;
-    }
-    return false;
-}
-
-// [HINT-2] Periodically compare useful vs. issued and nudge the shared degree up/down.
-static void maybe_adjust_degree()
-{
-    if (issued_since_eval < ACC_EVAL_WINDOW) return;
-
-    uint64_t acc_pct = (total_prefetches_issued == 0) ? 0
-                        : (useful_prefetches * 100) / total_prefetches_issued;
-
-    if (acc_pct >= ACC_HIGH_PCT && current_degree < MAX_PREFETCH_DEGREE)
-        current_degree++;
-    else if (acc_pct < ACC_LOW_PCT && current_degree > MIN_PREFETCH_DEGREE)
-        current_degree--;
-
-    issued_since_eval = 0;
-}
-
-/* ================================================================================== */
-
-void CACHE::l1d_prefetcher_initialize()
+void CACHE::l1d_prefetcher_initialize() 
 {
     std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "   Dual-Mode (Uniform + Non-Uniform) L1D Prefetcher" << std::endl;
+    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
 
-    for (int i = 0; i < IP_TRACKER_COUNT; i++) {
-        trackers[i].reset();
-        trackers[i].lru = i;
+    for(int i=0; i<SPP_TRACKER_COUNT; i++){
+        trackers[i].lru=i;
     }
-    for (int i = 0; i < PT_SIZE; i++)
-        pattern_table[i] = PTEntry();
-    for (int i = 0; i < PF_TRACK_SIZE; i++) {
-        pf_filter[i].valid = false;
-        pf_filter[i].tag = 0;
-    }
-
-    total_prefetches_issued = 0;
-    useful_prefetches = 0;
-    issued_since_eval = 0;
-    current_degree = BASE_PREFETCH_DEGREE;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
+    // check for a tracker hit
     uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
-    ip &= IP_MASK;
+    ip = ip & MASK_IP;
 
-    // [HINT-2] Usefulness bookkeeping: did this demand access land on a line we prefetched?
-    if (cache_hit && pf_filter_check_and_clear(cl_addr))
-        useful_prefetches++;
-
-    // [REQ-1] Find or allocate this IP's tracker
-    int index = find_tracker(ip);
-    if (index == -1) {
-        allocate_tracker(ip, cl_addr);
-        return;   // cold IP: no history yet, nothing to predict from
+    int index = -1;
+    for (index=0; index<SPP_TRACKER_COUNT; index++) {
+        if (trackers[index].ip == ip)
+            break;
     }
 
-    IPTracker &t = trackers[index];
+    // this is a new IP that doesn't have a tracker yet, so allocate one
+    if (index == SPP_TRACKER_COUNT) {
+        for (index=0; index<SPP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (SPP_TRACKER_COUNT-1))
+                break;
+        }
 
-    int64_t stride = compute_stride(cl_addr, t.last_cl_addr);
+        trackers[index].ip = ip;
+        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_stride = 0;
+        trackers[index].uniform_conf = 0;
+        trackers[index].pattern_index = 0;
 
-    if (stride == 0) {
-        // repeated access to the same line: don't corrupt existing history/confidence
-        return;
+    	for (int i=0; i<SPP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+        return; //metadata_in;
     }
 
-    // [REQ-4]/[HINT-1] Train the non-uniform pattern table using the signature that
-    // was in effect BEFORE this access, now that we know what actually happened next.
-    if (t.hist_count >= SIG_HIST_LEN) {
-        uint32_t prev_sig = compute_signature(t.ip, t.delta_hist, SIG_HIST_LEN);
-        pt_train(prev_sig, (int8_t)stride);
+    // calculate the stride between the current address and the last address
+    // this bit appears overly complicated because we're calculating
+    // differences between unsigned address variables
+    int64_t stride = 0;
+    if (cl_addr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
     }
 
-    // [REQ-2]/[HINT-1] Update uniform-stride confidence -- runs in parallel, always,
-    // regardless of which mode is currently "in charge" for this IP.
-    if (stride == t.last_stride)
-        t.uniform_conf = (t.uniform_conf < UNIFORM_CONF_MAX) ? t.uniform_conf + UNIFORM_CONF_INC : UNIFORM_CONF_MAX;
-    else
-        t.uniform_conf = (t.uniform_conf > UNIFORM_CONF_DEC) ? t.uniform_conf - UNIFORM_CONF_DEC : 0;
+    // don't do anything if we somehow saw the same address twice in a row
+    if (stride == 0)
+        return;	//metadata_in;
 
-    // Slide the delta-history window and (if full) look up the signature for THIS prediction
-    for (int i = 0; i < SIG_HIST_LEN - 1; i++)
-        t.delta_hist[i] = t.delta_hist[i + 1];
-    t.delta_hist[SIG_HIST_LEN - 1] = (int8_t)stride;
-    if (t.hist_count < SIG_HIST_LEN) t.hist_count++;
-
-    bool    have_sig = (t.hist_count >= SIG_HIST_LEN);
-    uint32_t sig = 0;
-    int8_t  pred_delta = 0;
-    uint8_t pt_conf = 0;
-    bool    pt_hit = false;
-    if (have_sig) {
-        sig = compute_signature(t.ip, t.delta_hist, SIG_HIST_LEN);
-        pt_hit = pt_lookup(sig, pred_delta, pt_conf);
+    // unifrom conf calc
+    if (stride == trackers[index].last_stride) {
+        trackers[index].uniform_conf++;
+    } else {
+        trackers[index].uniform_conf=0; // uniform pattern breaks
     }
 
-    // [REQ-3] Arbitration: uniform is checked first and wins whenever it's confirmed;
-    // non-uniform is only used as the fallback when uniform confidence is too low.
-    PredMode mode = MODE_TRAINING;
-    if (t.uniform_conf >= UNIFORM_CONF_THRESH)
-        mode = MODE_UNIFORM;
-    else if (pt_hit && pt_conf >= NONUNIFORM_CONF_THRESH)
-        mode = MODE_NONUNIFORM;
+    if(trackers[index].uniform_conf>0){
+        // do some prefetching
+        for (int i=0; i<PREFETCH_DEGREE; i++) {
+            uint64_t pf_address = (cl_addr + (trackers[index].last_stride*(i+1))) << LOG2_BLOCK_SIZE;
 
-    // [REQ-5] Issue prefetches (degree > 1) according to the chosen mode
-    if (mode == MODE_UNIFORM) {
-        for (int i = 0; i < current_degree; i++) {
-            uint64_t pf_cl   = cl_addr + stride * (i + 1);
-            uint64_t pf_addr = pf_cl << LOG2_BLOCK_SIZE;
-
-            // [HINT-3] stay within the current page
-            if ((pf_addr >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+            // only issue a prefetch if the prefetch address is in the same 4 KB page
+            // as the current demand access address
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
                 break;
 
-            if (MSHR.occupancy < (MSHR.SIZE >> 1))
-                prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
+            // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
+            if (MSHR.occupancy < (MSHR.SIZE>>1))
+              prefetch_line(ip, addr, pf_address, FILL_L1, 0);
             else
-                prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
-
-            total_prefetches_issued++;
-            issued_since_eval++;
-        }
-    } else if (mode == MODE_NONUNIFORM) {
-        // [REQ-4]/[REQ-5] Chain the pattern table against itself to reach degree > 1:
-        // feed each predicted delta back into a speculative window before the next lookup.
-        uint64_t chain_cl = cl_addr;
-        int8_t   chain_hist[SIG_HIST_LEN];
-        memcpy(chain_hist, t.delta_hist, sizeof(chain_hist));
-
-        for (int i = 0; i < current_degree; i++) {
-            uint32_t  hop_sig = compute_signature(t.ip, chain_hist, SIG_HIST_LEN);
-            int8_t    hop_delta; uint8_t hop_conf;
-
-            if (!pt_lookup(hop_sig, hop_delta, hop_conf))
-                break;                                                     // no known continuation
-            if (hop_conf < (uint8_t)(NONUNIFORM_CONF_THRESH + i * CHAIN_CONF_STEP))
-                break;                                                     // too little confidence this far out
-
-            chain_cl += hop_delta;
-            uint64_t pf_addr = chain_cl << LOG2_BLOCK_SIZE;
-
-            // [HINT-3] stay within the current page
-            if ((pf_addr >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
-                break;
-
-            if (MSHR.occupancy < (MSHR.SIZE >> 1))
-                prefetch_line(ip, addr, pf_addr, FILL_L1, 0);
-            else
-                prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
-
-            total_prefetches_issued++;
-            issued_since_eval++;
-
-            // speculatively slide the window forward with the predicted delta
-            for (int k = 0; k < SIG_HIST_LEN - 1; k++)
-                chain_hist[k] = chain_hist[k + 1];
-            chain_hist[SIG_HIST_LEN - 1] = hop_delta;
+              prefetch_line(ip, addr, pf_address, FILL_L2, 0);
         }
     }
-    // mode == MODE_TRAINING: not enough evidence yet for either hypothesis -> issue nothing
+    // Non-uniform case handling
+    else {
+        uint64_t current_pf_cl = cl_addr;
+        int temp_idx = trackers[index].pattern_index;
 
-    // [HINT-2] periodically re-evaluate accuracy and adjust the shared degree
-    maybe_adjust_degree();
 
-    // commit state for the next access
-    t.last_cl_addr = cl_addr;
-    t.last_stride  = stride;
-    touch_lru(index);
+        for(int i=0; i<PREFETCH_DEGREE; i++){
+            current_pf_cl +=fixed_pattern[temp_idx];
+            uint64_t pf_address = current_pf_cl << LOG2_BLOCK_SIZE;
+            
+            if((pf_address>>LOG2_PAGE_SIZE) != (addr>>LOG2_PAGE_SIZE))
+                break;
+            
+            if (MSHR.occupancy < (MSHR.SIZE>>1))
+              prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            else
+              prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+
+            temp_idx = (temp_idx+1) % pattern_length;
+        }
+
+        trackers[index].pattern_index = (trackers[index].pattern_index + 1) %  pattern_length;
+    }
+
+    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_stride = stride;
+
+    for (int i=0; i<SPP_TRACKER_COUNT; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru = 0;
+    return; //metadata_in;
 }
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-    // [HINT-2] Mark lines that actually landed in the cache because of our own
-    // prefetch, so a later demand hit on this line can be counted as "useful".
-    if (prefetch) {
-        uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
-        pf_filter_mark(cl_addr);
-    }
-    return; //metadata_in;
+	return; //metadata_in;
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
     std::cout << "------------------------------------------------" << std::endl;
-    std::cout << " L1D Dual-Mode Stride Prefetcher: Final Stats" << std::endl;
+    std::cout << " Degree: " << PREFETCH_DEGREE << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
-    std::cout << "Total prefetches issued : " << total_prefetches_issued << std::endl;
-    std::cout << "Useful prefetches       : " << useful_prefetches << std::endl;
-    uint64_t acc = (total_prefetches_issued == 0) ? 0 : (useful_prefetches * 100) / total_prefetches_issued;
-    std::cout << "Accuracy                : " << acc << "%" << std::endl;
-    std::cout << "Final adaptive degree   : " << current_degree << std::endl;
-    std::cout << "IP tracker entries      : " << IP_TRACKER_COUNT << std::endl;
-    std::cout << "Pattern table entries   : " << PT_SIZE << std::endl;
 }
