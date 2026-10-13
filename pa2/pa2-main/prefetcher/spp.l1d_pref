@@ -8,6 +8,16 @@
 #define PREFETCH_DEGREE 3
 #define MASK_IP 0xFFF           // [P1] was 0xFF (8-bit IP tag)
 
+// [P2] Phase 2: clean stride history.
+//      (a) A stride outside -64..+63 lines can never give a same-page prefetch and is
+//          usually a jump to a new data structure, so it restarts this IP's history
+//          instead of being written into the PHT.
+//      (b) The PHT is only trained and only read once the IP has seen HIST_NEEDED
+//          strides since its last restart, so half-empty signatures do not pollute it.
+#define STRIDE_MAX 63           // [P2]
+#define STRIDE_MIN (-64)        // [P2]
+#define HIST_NEEDED 3           // [P2] strides needed before the signature is trusted
+
 // dynamic pattern tracking
 #define PHT_SIZE 4096 // 12-bit signature space
 #define STRIDE_MASK 0xF // 4 bits per stride
@@ -45,6 +55,9 @@ class SPP_TRACKER{
     // [P1] an empty tracker must not match an IP whose tag happens to be 0
     bool valid;
 
+    // [P2] number of strides seen since this IP's history was last restarted (0..HIST_NEEDED)
+    int hist_count;
+
     SPP_TRACKER () {
         ip = 0;
         last_cl_addr = 0;
@@ -53,6 +66,7 @@ class SPP_TRACKER{
         uniform_conf=0;
         signature=0;
         valid=false;             // [P1]
+        hist_count=0;            // [P2]
     };
 };
 
@@ -125,6 +139,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         trackers[index].uniform_conf = 0;
         trackers[index].signature = 0;
         trackers[index].valid = true;   // [P1]
+        trackers[index].hist_count = 0; // [P2]
 
     	for (int i=0; i<SPP_TRACKER_COUNT; i++) {
             if (trackers[i].lru < trackers[index].lru)
@@ -149,12 +164,32 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
     if (stride == 0)
         return;	//metadata_in;
 
+    // [P2] (a) out-of-range stride: restart this IP's history from the current line
+    if (stride > STRIDE_MAX || stride < STRIDE_MIN) {
+        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_stride = 0;
+        trackers[index].uniform_conf = 0;
+        trackers[index].signature = 0;
+        trackers[index].hist_count = 0;
+
+        for (int i=0; i<SPP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+        return;
+    }
+
     // 1. Train the PHT: The previous signature led to THIS current stride
-    PHT[trackers[index].signature]=stride;
+    // [P2] (b) only when the signature is built from HIST_NEEDED real strides
+    if (trackers[index].hist_count >= HIST_NEEDED)
+        PHT[trackers[index].signature]=stride;
 
     // 2. Update the IP's signature with the current stride
     // Shift left by 4 bits, insert the new 4-bit stride, and mask to 12 bits
     trackers[index].signature = ((trackers[index].signature<<4) | (stride & STRIDE_MASK)) & SIG_MASK;
+    if (trackers[index].hist_count < HIST_NEEDED)   // [P2]
+        trackers[index].hist_count++;
 
     // unifrom conf calc
     if (stride == trackers[index].last_stride) {
@@ -183,7 +218,8 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         }
     }
     // Non-uniform case handling
-    else {
+    // [P2] (b) only once the signature is built from HIST_NEEDED real strides
+    else if (trackers[index].hist_count >= HIST_NEEDED) {
         uint64_t current_pf_cl = cl_addr;
         // int temp_idx = trackers[index].pattern_index;
         uint32_t speculative_sig = trackers[index].signature;
