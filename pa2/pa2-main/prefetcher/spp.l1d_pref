@@ -26,7 +26,19 @@
 // Accuracy Throttling Parameters
 #define EVAL_INTERVAL 1000 // Evaluate accuracy every 1000 demand requests
 
-int64_t PHT[PHT_SIZE];
+// [P3] Phase 3: confidence per PHT entry.
+//      Each entry now remembers how reliably its signature has been followed by the
+//      stored stride (2-bit saturating counter, 0..3). A prediction is used only when
+//      the counter is high enough, instead of whenever the entry is non-zero.
+#define PHT_CONF_MAX 3          // [P3] 2-bit counter
+#define PRED_CONF 2             // [P3] confidence needed for the first predicted stride
+#define CHAIN_CONF 3            // [P3] confidence needed for every further (speculative) stride
+
+struct PHT_ENTRY {              // [P3] was: int64_t PHT[PHT_SIZE]
+    int64_t stride;             //      predicted next stride
+    int conf;                   //      0 = empty, 1..PHT_CONF_MAX
+};
+PHT_ENTRY PHT[PHT_SIZE];
 
 int current_degree = 3;
 
@@ -82,7 +94,8 @@ void CACHE::l1d_prefetcher_initialize()
         trackers[i].lru=i;
     }
     for(int i=0; i<PHT_SIZE; i++){
-        PHT[i]=0;
+        PHT[i].stride=0;        // [P3]
+        PHT[i].conf=0;          // [P3]
     }
 
     current_degree = 3;
@@ -182,8 +195,22 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
     // 1. Train the PHT: The previous signature led to THIS current stride
     // [P2] (b) only when the signature is built from HIST_NEEDED real strides
-    if (trackers[index].hist_count >= HIST_NEEDED)
-        PHT[trackers[index].signature]=stride;
+    if (trackers[index].hist_count >= HIST_NEEDED) {
+        // [P3] confidence update instead of a blind overwrite
+        PHT_ENTRY &e = PHT[trackers[index].signature];
+        if (e.conf == 0) {                       // empty entry: install
+            e.stride = stride;
+            e.conf = 1;
+        } else if (e.stride == stride) {         // prediction confirmed
+            if (e.conf < PHT_CONF_MAX) e.conf++;
+        } else {                                 // prediction wrong
+            e.conf--;
+            if (e.conf == 0) {                   // lost all confidence: learn the new stride
+                e.stride = stride;
+                e.conf = 1;
+            }
+        }
+    }
 
     // 2. Update the IP's signature with the current stride
     // Shift left by 4 bits, insert the new 4-bit stride, and mask to 12 bits
@@ -226,9 +253,13 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
 
         for(int i=0; i<current_degree; i++){
-            int64_t predicted_stride = PHT[speculative_sig];
+            int64_t predicted_stride = PHT[speculative_sig].stride;
 
             if(predicted_stride==0) 
+                break;
+
+            // [P3] only follow a confident entry; deeper (speculative) steps need full confidence
+            if (PHT[speculative_sig].conf < (i == 0 ? PRED_CONF : CHAIN_CONF))
                 break;
             
             // current_pf_cl +=fixed_pattern[temp_idx];
