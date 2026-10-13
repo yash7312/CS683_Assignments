@@ -1,9 +1,12 @@
 #include "cache.h"
 #include <iostream>
 
-#define SPP_TRACKER_COUNT 24
+// [P1] Phase 1: bigger IP table with a wider IP tag and a valid bit.
+//      24 trackers / 8-bit tag -> 128 trackers / 12-bit tag, so unrelated load IPs
+//      stop sharing (and corrupting) the same tracker.
+#define SPP_TRACKER_COUNT 128   // [P1] was 24
 #define PREFETCH_DEGREE 3
-#define MASK_IP 0xFF
+#define MASK_IP 0xFFF           // [P1] was 0xFF (8-bit IP tag)
 
 // dynamic pattern tracking
 #define PHT_SIZE 4096 // 12-bit signature space
@@ -39,6 +42,9 @@ class SPP_TRACKER{
     int uniform_conf;
     uint32_t signature;
 
+    // [P1] an empty tracker must not match an IP whose tag happens to be 0
+    bool valid;
+
     SPP_TRACKER () {
         ip = 0;
         last_cl_addr = 0;
@@ -46,6 +52,7 @@ class SPP_TRACKER{
         lru = 0;
         uniform_conf=0;
         signature=0;
+        valid=false;             // [P1]
     };
 };
 
@@ -101,7 +108,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
     int index = -1;
     for (index=0; index<SPP_TRACKER_COUNT; index++) {
-        if (trackers[index].ip == ip)
+        if (trackers[index].valid && trackers[index].ip == ip)   // [P1] check valid bit
             break;
     }
 
@@ -117,6 +124,7 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
         trackers[index].last_stride = 0;
         trackers[index].uniform_conf = 0;
         trackers[index].signature = 0;
+        trackers[index].valid = true;   // [P1]
 
     	for (int i=0; i<SPP_TRACKER_COUNT; i++) {
             if (trackers[i].lru < trackers[index].lru)
