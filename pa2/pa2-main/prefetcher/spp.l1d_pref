@@ -1,3 +1,4 @@
+// CANDIDATE of spp.l1d_pref (SPP-AC): 8-bit IP tag and 32-entry prefetch filter (both from the sweep), everything else unchanged
 #include "cache.h"
 #include <iostream>
 
@@ -6,7 +7,7 @@
 //      stop sharing (and corrupting) the same tracker.
 #define SPP_TRACKER_COUNT 128   // [P1] was 24
 #define PREFETCH_DEGREE 3
-#define MASK_IP 0xFFF           // [P1] was 0xFF (8-bit IP tag)
+#define MASK_IP 0xFF            // [P1] was 0xFF (8-bit IP tag)
 
 // [P2] Phase 2: clean stride history.
 //      (a) A stride outside -64..+63 lines can never give a same-page prefetch and is
@@ -41,7 +42,7 @@
 
 // [ACC] Filter of "lines we prefetched that no demand load has used yet".
 //      Direct-mapped by the low bits of the line address, with a partial tag.
-#define PF_FILTER_SIZE 64       // entries (power of 2)
+#define PF_FILTER_SIZE 32       // entries (power of 2)
 #define PF_TAG_BITS    10
 
 // [P3] Phase 3: confidence per PHT entry.
