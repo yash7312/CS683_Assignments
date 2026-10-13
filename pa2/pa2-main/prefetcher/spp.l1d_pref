@@ -23,8 +23,26 @@
 #define STRIDE_MASK 0xF // 4 bits per stride
 #define SIG_MASK 0xFFF // 12 bits total (3 strides)
 
-// Accuracy Throttling Parameters
-#define EVAL_INTERVAL 1000 // Evaluate accuracy every 1000 demand requests
+// [ACC] Accuracy checker + throttling.
+//      accuracy = (prefetched lines that a demand load later hit) / (prefetched lines
+//      that were filled into L1D), measured over one epoch of ACC_WINDOW fills.
+//      At the end of each epoch the degree for the next epoch is chosen from the
+//      accuracy range below. These are the values compared in the sensitivity study.
+#define ACC_WINDOW   256        // prefetch fills per accuracy epoch
+#define ACC_HIGH     75         // accuracy >= ACC_HIGH            -> DEGREE_HIGH
+#define ACC_MID      50         // ACC_MID <= accuracy < ACC_HIGH  -> DEGREE_MID
+#define ACC_LOW      25         // ACC_LOW <= accuracy < ACC_MID   -> DEGREE_LOW
+#define DEGREE_HIGH  6          //            accuracy < ACC_LOW   -> DEGREE_MIN
+#define DEGREE_MID   4
+#define DEGREE_LOW   2
+#define DEGREE_MIN   1
+#define START_DEGREE 3          // degree used until the first epoch ends
+#define FIXED_DEGREE 0          // > 0: throttling off, always use this degree (sensitivity study only)
+
+// [ACC] Filter of "lines we prefetched that no demand load has used yet".
+//      Direct-mapped by the low bits of the line address, with a partial tag.
+#define PF_FILTER_SIZE 64       // entries (power of 2)
+#define PF_TAG_BITS    10
 
 // [P3] Phase 3: confidence per PHT entry.
 //      Each entry now remembers how reliably its signature has been followed by the
@@ -42,10 +60,43 @@ PHT_ENTRY PHT[PHT_SIZE];
 
 int current_degree = 3;
 
-// Global counters for accuracy calculation
-uint64_t total_issued_prefetches = 0;
-uint64_t total_useful_prefetches = 0;
-uint64_t access_counter = 0;
+// Global counters
+uint64_t total_issued_prefetches = 0;   // statistics only
+
+// [ACC] accuracy checker state
+struct PF_FILTER_ENTRY {
+    bool valid;                 // 1 bit
+    uint32_t tag;               // PF_TAG_BITS
+};
+PF_FILTER_ENTRY pf_filter[PF_FILTER_SIZE];
+uint32_t epoch_fills  = 0;      // prefetched lines filled into L1D in this epoch
+uint32_t epoch_useful = 0;      // ... of which a demand load hit at least once
+
+// [ACC] statistics only
+uint64_t stat_fills = 0, stat_useful = 0, stat_epochs = 0;
+uint64_t stat_epochs_at_degree[8] = {0};
+
+static inline uint32_t pf_index(uint64_t line) { return line & (PF_FILTER_SIZE - 1); }
+static inline uint32_t pf_tag(uint64_t line)   { return (line / PF_FILTER_SIZE) & ((1u << PF_TAG_BITS) - 1); }
+
+// [ACC] choose the degree for the next epoch from this epoch's accuracy
+static void evaluate_accuracy()
+{
+    uint32_t acc = (epoch_useful * 100) / epoch_fills;
+#if FIXED_DEGREE > 0
+    current_degree = FIXED_DEGREE;
+#else
+    if      (acc >= ACC_HIGH) current_degree = DEGREE_HIGH;
+    else if (acc >= ACC_MID)  current_degree = DEGREE_MID;
+    else if (acc >= ACC_LOW)  current_degree = DEGREE_LOW;
+    else                      current_degree = DEGREE_MIN;
+#endif
+    (void)acc;
+    stat_epochs++;
+    if (current_degree < 8) stat_epochs_at_degree[current_degree]++;
+    epoch_fills = 0;
+    epoch_useful = 0;
+}
 
 class SPP_TRACKER{
   public:
@@ -98,35 +149,27 @@ void CACHE::l1d_prefetcher_initialize()
         PHT[i].conf=0;          // [P3]
     }
 
-    current_degree = 3;
+    current_degree = (FIXED_DEGREE > 0) ? FIXED_DEGREE : START_DEGREE;   // [ACC]
     total_issued_prefetches = 0;
-    total_useful_prefetches = 0;
-    access_counter = 0;
+    for (int i=0; i<PF_FILTER_SIZE; i++)                                // [ACC]
+        pf_filter[i].valid = false;
+    epoch_fills = 0;
+    epoch_useful = 0;
 }
 
 void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
 {
-    access_counter++;
-
-    // Periodically evaluate prefetch accuracy and adjust degree
-    if (access_counter >= EVAL_INTERVAL) {
-        if (total_issued_prefetches > 0) {
-            float accuracy = (float)total_useful_prefetches / total_issued_prefetches;
-
-            // Accuracy Threshold Logic
-            if (accuracy >= 0.50) {
-                current_degree = 3; // High accuracy: full aggressiveness
-            } else if (accuracy >= 0.25) {
-                current_degree = 2; // Moderate accuracy: moderate degree
-            } else {
-                current_degree = 1; // Low accuracy: conservative degree
-            }
+    // [ACC] Usefulness: a demand load that HITS a line our prefetch brought in.
+    //       The mark is cleared, so each prefetched line counts as useful at most once.
+    //       'addr' here is the virtual address, which is why cache_fill marks v_addr.
+    if (cache_hit) {
+        uint64_t line = addr >> LOG2_BLOCK_SIZE;
+        PF_FILTER_ENTRY &f = pf_filter[pf_index(line)];
+        if (f.valid && f.tag == pf_tag(line)) {
+            f.valid = false;
+            epoch_useful++;
+            stat_useful++;
         }
-
-        // Reset epoch counters
-        total_issued_prefetches = 0;
-        total_useful_prefetches = 0;
-        access_counter = 0;
     }
 
     // check for a tracker hit
@@ -294,15 +337,32 @@ void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit
 
 void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
 {
-	// adding metadata for accuracy based throttling
+    // [ACC] One of our prefetches has just been written into L1D. Remember the line
+    //       (by its VIRTUAL address, the same address space l1d_prefetcher_operate sees;
+    //       'addr' here is the physical address and would never match) and count the fill.
     if (prefetch == 1) {
-        total_useful_prefetches++;
+        uint64_t line = v_addr >> LOG2_BLOCK_SIZE;
+        PF_FILTER_ENTRY &f = pf_filter[pf_index(line)];
+        f.valid = true;
+        f.tag = pf_tag(line);
+        epoch_fills++;
+        stat_fills++;
+        if (epoch_fills >= ACC_WINDOW)
+            evaluate_accuracy();
     }
 }
 
 void CACHE::l1d_prefetcher_final_stats()
 {
     std::cout << "------------------------------------------------" << std::endl;
+    std::cout << " SPP prefetch requests     : " << total_issued_prefetches << std::endl;
+    std::cout << " SPP fills into L1D        : " << stat_fills << std::endl;
+    std::cout << " SPP useful (own checker)  : " << stat_useful << std::endl;
+    std::cout << " SPP accuracy (own checker): " << (stat_fills ? 100.0 * stat_useful / stat_fills : 0.0) << " %" << std::endl;
+    std::cout << " SPP epochs at degree      :";
+    for (int d = 1; d < 8; d++)
+        if (stat_epochs_at_degree[d]) std::cout << " " << d << ":" << stat_epochs_at_degree[d];
+    std::cout << "  (total " << stat_epochs << ")" << std::endl;
     std::cout << " Final dynamic Degree: " << current_degree << std::endl;
     std::cout << "------------------------------------------------" << std::endl;
 }
