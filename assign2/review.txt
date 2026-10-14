@@ -1,0 +1,7 @@
+1. In the file inc/cache.h, the update_replacement_state is done for all the caches, is it necessary according to the PA2, or is only updating the L2 as described by the PS enough ? 
+2. base_update_replacement_state, accepts a isInstruction, is that necessary ? not used in the function ? Same goes for all the other replacement policies, that is all the files in the replacement/ folder. 
+3. In the cache.cc, we need to add comment, for the VIVA with a marker, to know where the code is changed. 
+4. In the ooo_cpu.cc, should we even change the btb according to the ps ? 
+5. page_table_walker, try to compile without return, as we are using GCC 7 for this assignment. 
+6. In the replacement/dyn_irrip.l2c_repl, replacement/irrip.l2c_repl : How this differs from the other files. 
+  
