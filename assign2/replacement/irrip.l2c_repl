@@ -1,0 +1,111 @@
+#include "cache.h"
+
+// ---------------------------------------------------------------------------
+// Instruction-conscious RRIP (I-RRIP) for the L2C
+//
+// 2-bit RRPV per line, as in SRRIP. Instruction lines are preferred over data
+// lines in all three parts of the policy:
+//   insertion : instruction lines enter near (RRPV IRRIP_INS_INSTR), data
+//               lines enter distant (RRPV IRRIP_INS_DATA)
+//   promotion : an instruction hit goes to RRPV 0; a data hit only moves one
+//               step closer (IRRIP_DATA_PROMO_STEP); writeback hits do not
+//               promote (they are not a reuse by the core)
+//   eviction  : among the lines at maxRRPV, a data line is chosen before an
+//               instruction line
+// The knobs below are the values chosen in the Task 2A ablation study; each
+// one can be overridden with a #define before including this file.
+// ---------------------------------------------------------------------------
+
+#define maxRRPV 3
+
+#ifndef IRRIP_INS_INSTR
+#define IRRIP_INS_INSTR 0          // RRPV of an inserted instruction line
+#endif
+#ifndef IRRIP_INS_DATA
+#define IRRIP_INS_DATA 3           // RRPV of an inserted data line
+#endif
+#ifndef IRRIP_DATA_PROMO_STEP
+#define IRRIP_DATA_PROMO_STEP 0    // 0: data hit -> RRPV 0, k: data hit -> RRPV - k
+#endif
+#ifndef IRRIP_WB_PROMOTE
+#define IRRIP_WB_PROMOTE 0         // 1: a writeback hit promotes like a data hit
+#endif
+#ifndef IRRIP_DATA_FIRST_EVICT
+#define IRRIP_DATA_FIRST_EVICT 1   // 1: prefer a data victim among the maxRRPV lines
+#endif
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+// the instruction flag is only meaningful for demand/prefetch line fills;
+// translation and writeback packets are data
+static inline uint8_t irrip_is_instr(uint32_t type, uint8_t isInstruction)
+{
+    return isInstruction && (type == LOAD || type == PREFETCH);
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize I-RRIP state for L2C (ins instr " << IRRIP_INS_INSTR << ", ins data " << IRRIP_INS_DATA
+         << ", data promo step " << IRRIP_DATA_PROMO_STEP << ", wb promote " << IRRIP_WB_PROMOTE
+         << ", data-first evict " << IRRIP_DATA_FIRST_EVICT << ")" << endl;
+
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++)
+            l2_rrpv[i][j] = maxRRPV;
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    // an invalid way is always the best victim
+    for (int i = 0; i < L2C_WAY; i++)
+        if (!current_set[i].valid)
+            return i;
+
+    while (1) {
+        int instr_victim = -1;
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] != maxRRPV)
+                continue;
+            if (!IRRIP_DATA_FIRST_EVICT || !current_set[i].instruction)
+                return i;
+            if (instr_victim < 0)
+                instr_victim = i;
+        }
+        if (instr_victim >= 0)
+            return instr_victim;
+
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    uint8_t instr = irrip_is_instr(type, isInstruction);
+
+    if (hit) {
+        if (type == WRITEBACK && !IRRIP_WB_PROMOTE)
+            return;
+        if (instr || IRRIP_DATA_PROMO_STEP == 0)
+            l2_rrpv[set][way] = 0;
+        else if (l2_rrpv[set][way] > IRRIP_DATA_PROMO_STEP)
+            l2_rrpv[set][way] -= IRRIP_DATA_PROMO_STEP;
+        else
+            l2_rrpv[set][way] = 0;
+        return;
+    }
+
+    l2_rrpv[set][way] = instr ? IRRIP_INS_INSTR : IRRIP_INS_DATA;
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+
+}

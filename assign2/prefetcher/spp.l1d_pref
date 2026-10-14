@@ -1,0 +1,369 @@
+// CANDIDATE of spp.l1d_pref (SPP-AC): 8-bit IP tag and 32-entry prefetch filter (both from the sweep), everything else unchanged
+#include "cache.h"
+#include <iostream>
+
+// [P1] Phase 1: bigger IP table with a wider IP tag and a valid bit.
+//      24 trackers / 8-bit tag -> 128 trackers / 12-bit tag, so unrelated load IPs
+//      stop sharing (and corrupting) the same tracker.
+#define SPP_TRACKER_COUNT 128   // [P1] was 24
+#define PREFETCH_DEGREE 3
+#define MASK_IP 0xFF            // [P1] was 0xFF (8-bit IP tag)
+
+// [P2] Phase 2: clean stride history.
+//      (a) A stride outside -64..+63 lines can never give a same-page prefetch and is
+//          usually a jump to a new data structure, so it restarts this IP's history
+//          instead of being written into the PHT.
+//      (b) The PHT is only trained and only read once the IP has seen HIST_NEEDED
+//          strides since its last restart, so half-empty signatures do not pollute it.
+#define STRIDE_MAX 63           // [P2]
+#define STRIDE_MIN (-64)        // [P2]
+#define HIST_NEEDED 3           // [P2] strides needed before the signature is trusted
+
+// dynamic pattern tracking
+#define PHT_SIZE 4096 // 12-bit signature space
+#define STRIDE_MASK 0xF // 4 bits per stride
+#define SIG_MASK 0xFFF // 12 bits total (3 strides)
+
+// [ACC] Accuracy checker + throttling.
+//      accuracy = (prefetched lines that a demand load later hit) / (prefetched lines
+//      that were filled into L1D), measured over one epoch of ACC_WINDOW fills.
+//      At the end of each epoch the degree for the next epoch is chosen from the
+//      accuracy range below. These are the values compared in the sensitivity study.
+#define ACC_WINDOW   256        // prefetch fills per accuracy epoch
+#define ACC_HIGH     75         // accuracy >= ACC_HIGH            -> DEGREE_HIGH
+#define ACC_MID      50         // ACC_MID <= accuracy < ACC_HIGH  -> DEGREE_MID
+#define ACC_LOW      25         // ACC_LOW <= accuracy < ACC_MID   -> DEGREE_LOW
+#define DEGREE_HIGH  6          //            accuracy < ACC_LOW   -> DEGREE_MIN
+#define DEGREE_MID   4
+#define DEGREE_LOW   2
+#define DEGREE_MIN   1
+#define START_DEGREE 3          // degree used until the first epoch ends
+#define FIXED_DEGREE 0          // > 0: throttling off, always use this degree (sensitivity study only)
+
+// [ACC] Filter of "lines we prefetched that no demand load has used yet".
+//      Direct-mapped by the low bits of the line address, with a partial tag.
+#define PF_FILTER_SIZE 32       // entries (power of 2)
+#define PF_TAG_BITS    10
+
+// [P3] Phase 3: confidence per PHT entry.
+//      Each entry now remembers how reliably its signature has been followed by the
+//      stored stride (2-bit saturating counter, 0..3). A prediction is used only when
+//      the counter is high enough, instead of whenever the entry is non-zero.
+#define PHT_CONF_MAX 3          // [P3] 2-bit counter
+#define PRED_CONF 2             // [P3] confidence needed for the first predicted stride
+#define CHAIN_CONF 3            // [P3] confidence needed for every further (speculative) stride
+
+struct PHT_ENTRY {              // [P3] was: int64_t PHT[PHT_SIZE]
+    int64_t stride;             //      predicted next stride
+    int conf;                   //      0 = empty, 1..PHT_CONF_MAX
+};
+PHT_ENTRY PHT[PHT_SIZE];
+
+int current_degree = 3;
+
+// Global counters
+uint64_t total_issued_prefetches = 0;   // statistics only
+
+// [ACC] accuracy checker state
+struct PF_FILTER_ENTRY {
+    bool valid;                 // 1 bit
+    uint32_t tag;               // PF_TAG_BITS
+};
+PF_FILTER_ENTRY pf_filter[PF_FILTER_SIZE];
+uint32_t epoch_fills  = 0;      // prefetched lines filled into L1D in this epoch
+uint32_t epoch_useful = 0;      // ... of which a demand load hit at least once
+
+// [ACC] statistics only
+uint64_t stat_fills = 0, stat_useful = 0, stat_epochs = 0;
+uint64_t stat_epochs_at_degree[8] = {0};
+
+static inline uint32_t pf_index(uint64_t line) { return line & (PF_FILTER_SIZE - 1); }
+static inline uint32_t pf_tag(uint64_t line)   { return (line / PF_FILTER_SIZE) & ((1u << PF_TAG_BITS) - 1); }
+
+// [ACC] choose the degree for the next epoch from this epoch's accuracy
+static void evaluate_accuracy()
+{
+    uint32_t acc = (epoch_useful * 100) / epoch_fills;
+#if FIXED_DEGREE > 0
+    current_degree = FIXED_DEGREE;
+#else
+    if      (acc >= ACC_HIGH) current_degree = DEGREE_HIGH;
+    else if (acc >= ACC_MID)  current_degree = DEGREE_MID;
+    else if (acc >= ACC_LOW)  current_degree = DEGREE_LOW;
+    else                      current_degree = DEGREE_MIN;
+#endif
+    (void)acc;
+    stat_epochs++;
+    if (current_degree < 8) stat_epochs_at_degree[current_degree]++;
+    epoch_fills = 0;
+    epoch_useful = 0;
+}
+
+class SPP_TRACKER{
+  public:
+    // the IP we're tracking
+    uint64_t ip;
+
+    // the last address accessed by this IP
+    uint64_t last_cl_addr;
+
+    // the stride between the last two addresses accessed by this IP
+    int64_t last_stride;
+
+    // use LRU to evict old IP trackers
+    uint32_t lru;
+
+    int uniform_conf;
+    uint32_t signature;
+
+    // [P1] an empty tracker must not match an IP whose tag happens to be 0
+    bool valid;
+
+    // [P2] number of strides seen since this IP's history was last restarted (0..HIST_NEEDED)
+    int hist_count;
+
+    SPP_TRACKER () {
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        lru = 0;
+        uniform_conf=0;
+        signature=0;
+        valid=false;             // [P1]
+        hist_count=0;            // [P2]
+    };
+};
+
+SPP_TRACKER trackers[SPP_TRACKER_COUNT];
+
+void CACHE::l1d_prefetcher_initialize() 
+{
+    std::cout << "------------------------------------------------" << std::endl;
+    std::cout << "        Stride Pattern Prefetcher (SPP)         " << std::endl;
+    std::cout << "------------------------------------------------" << std::endl;
+
+    for(int i=0; i<SPP_TRACKER_COUNT; i++){
+        trackers[i].lru=i;
+    }
+    for(int i=0; i<PHT_SIZE; i++){
+        PHT[i].stride=0;        // [P3]
+        PHT[i].conf=0;          // [P3]
+    }
+
+    current_degree = (FIXED_DEGREE > 0) ? FIXED_DEGREE : START_DEGREE;   // [ACC]
+    total_issued_prefetches = 0;
+    for (int i=0; i<PF_FILTER_SIZE; i++)                                // [ACC]
+        pf_filter[i].valid = false;
+    epoch_fills = 0;
+    epoch_useful = 0;
+}
+
+void CACHE::l1d_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint8_t critical_ip_flag)
+{
+    // [ACC] Usefulness: a demand load that HITS a line our prefetch brought in.
+    //       The mark is cleared, so each prefetched line counts as useful at most once.
+    //       'addr' here is the virtual address, which is why cache_fill marks v_addr.
+    if (cache_hit) {
+        uint64_t line = addr >> LOG2_BLOCK_SIZE;
+        PF_FILTER_ENTRY &f = pf_filter[pf_index(line)];
+        if (f.valid && f.tag == pf_tag(line)) {
+            f.valid = false;
+            epoch_useful++;
+            stat_useful++;
+        }
+    }
+
+    // check for a tracker hit
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    ip = ip & MASK_IP;
+
+    int index = -1;
+    for (index=0; index<SPP_TRACKER_COUNT; index++) {
+        if (trackers[index].valid && trackers[index].ip == ip)   // [P1] check valid bit
+            break;
+    }
+
+    // this is a new IP that doesn't have a tracker yet, so allocate one
+    if (index == SPP_TRACKER_COUNT) {
+        for (index=0; index<SPP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (SPP_TRACKER_COUNT-1))
+                break;
+        }
+
+        trackers[index].ip = ip;
+        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_stride = 0;
+        trackers[index].uniform_conf = 0;
+        trackers[index].signature = 0;
+        trackers[index].valid = true;   // [P1]
+        trackers[index].hist_count = 0; // [P2]
+
+    	for (int i=0; i<SPP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+        return; //metadata_in;
+    }
+
+    // calculate the stride between the current address and the last address
+    // this bit appears overly complicated because we're calculating
+    // differences between unsigned address variables
+    int64_t stride = 0;
+    if (cl_addr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
+    }
+
+    // don't do anything if we somehow saw the same address twice in a row
+    if (stride == 0)
+        return;	//metadata_in;
+
+    // [P2] (a) out-of-range stride: restart this IP's history from the current line
+    if (stride > STRIDE_MAX || stride < STRIDE_MIN) {
+        trackers[index].last_cl_addr = cl_addr;
+        trackers[index].last_stride = 0;
+        trackers[index].uniform_conf = 0;
+        trackers[index].signature = 0;
+        trackers[index].hist_count = 0;
+
+        for (int i=0; i<SPP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;
+        return;
+    }
+
+    // 1. Train the PHT: The previous signature led to THIS current stride
+    // [P2] (b) only when the signature is built from HIST_NEEDED real strides
+    if (trackers[index].hist_count >= HIST_NEEDED) {
+        // [P3] confidence update instead of a blind overwrite
+        PHT_ENTRY &e = PHT[trackers[index].signature];
+        if (e.conf == 0) {                       // empty entry: install
+            e.stride = stride;
+            e.conf = 1;
+        } else if (e.stride == stride) {         // prediction confirmed
+            if (e.conf < PHT_CONF_MAX) e.conf++;
+        } else {                                 // prediction wrong
+            e.conf--;
+            if (e.conf == 0) {                   // lost all confidence: learn the new stride
+                e.stride = stride;
+                e.conf = 1;
+            }
+        }
+    }
+
+    // 2. Update the IP's signature with the current stride
+    // Shift left by 4 bits, insert the new 4-bit stride, and mask to 12 bits
+    trackers[index].signature = ((trackers[index].signature<<4) | (stride & STRIDE_MASK)) & SIG_MASK;
+    if (trackers[index].hist_count < HIST_NEEDED)   // [P2]
+        trackers[index].hist_count++;
+
+    // unifrom conf calc
+    if (stride == trackers[index].last_stride) {
+        trackers[index].uniform_conf++;
+    } else {
+        trackers[index].uniform_conf=0; // uniform pattern breaks
+    }
+
+    if(trackers[index].uniform_conf>0){
+        // do some prefetching
+        for (int i=0; i<current_degree; i++) {
+            uint64_t pf_address = (cl_addr + (trackers[index].last_stride*(i+1))) << LOG2_BLOCK_SIZE;
+
+            // only issue a prefetch if the prefetch address is in the same 4 KB page
+            // as the current demand access address
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                break;
+
+            // check the MSHR occupancy to decide if we're going to prefetch to the L1 or L2
+            if (MSHR.occupancy < (MSHR.SIZE>>1))
+              prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            else
+              prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+
+            total_issued_prefetches++; // Track issued prefetch 
+        }
+    }
+    // Non-uniform case handling
+    // [P2] (b) only once the signature is built from HIST_NEEDED real strides
+    else if (trackers[index].hist_count >= HIST_NEEDED) {
+        uint64_t current_pf_cl = cl_addr;
+        // int temp_idx = trackers[index].pattern_index;
+        uint32_t speculative_sig = trackers[index].signature;
+
+
+        for(int i=0; i<current_degree; i++){
+            int64_t predicted_stride = PHT[speculative_sig].stride;
+
+            if(predicted_stride==0) 
+                break;
+
+            // [P3] only follow a confident entry; deeper (speculative) steps need full confidence
+            if (PHT[speculative_sig].conf < (i == 0 ? PRED_CONF : CHAIN_CONF))
+                break;
+            
+            // current_pf_cl +=fixed_pattern[temp_idx];
+            current_pf_cl += predicted_stride;
+
+            uint64_t pf_address = current_pf_cl << LOG2_BLOCK_SIZE;
+
+            if((pf_address>>LOG2_PAGE_SIZE) != (addr>>LOG2_PAGE_SIZE))
+                break;
+            
+            if (MSHR.occupancy < (MSHR.SIZE>>1))
+              prefetch_line(ip, addr, pf_address, FILL_L1, 0);
+            else
+              prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+
+            total_issued_prefetches++; // Track issued prefetch
+
+            speculative_sig = ((speculative_sig<<4) | (predicted_stride & STRIDE_MASK)) & SIG_MASK;
+        }
+    }
+
+    trackers[index].last_cl_addr = cl_addr;
+    trackers[index].last_stride = stride;
+
+    for (int i=0; i<SPP_TRACKER_COUNT; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru = 0;
+    return; //metadata_in;
+}
+
+void CACHE::l1d_prefetcher_cache_fill(uint64_t v_addr, uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t v_evicted_addr, uint64_t evicted_addr, uint32_t metadata_in)
+{
+    // [ACC] One of our prefetches has just been written into L1D. Remember the line
+    //       (by its VIRTUAL address, the same address space l1d_prefetcher_operate sees;
+    //       'addr' here is the physical address and would never match) and count the fill.
+    if (prefetch == 1) {
+        uint64_t line = v_addr >> LOG2_BLOCK_SIZE;
+        PF_FILTER_ENTRY &f = pf_filter[pf_index(line)];
+        f.valid = true;
+        f.tag = pf_tag(line);
+        epoch_fills++;
+        stat_fills++;
+        if (epoch_fills >= ACC_WINDOW)
+            evaluate_accuracy();
+    }
+}
+
+void CACHE::l1d_prefetcher_final_stats()
+{
+    std::cout << "------------------------------------------------" << std::endl;
+    std::cout << " SPP prefetch requests     : " << total_issued_prefetches << std::endl;
+    std::cout << " SPP fills into L1D        : " << stat_fills << std::endl;
+    std::cout << " SPP useful (own checker)  : " << stat_useful << std::endl;
+    std::cout << " SPP accuracy (own checker): " << (stat_fills ? 100.0 * stat_useful / stat_fills : 0.0) << " %" << std::endl;
+    std::cout << " SPP epochs at degree      :";
+    for (int d = 1; d < 8; d++)
+        if (stat_epochs_at_degree[d]) std::cout << " " << d << ":" << stat_epochs_at_degree[d];
+    std::cout << "  (total " << stat_epochs << ")" << std::endl;
+    std::cout << " Final dynamic Degree: " << current_degree << std::endl;
+    std::cout << "------------------------------------------------" << std::endl;
+}

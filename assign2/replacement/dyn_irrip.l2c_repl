@@ -1,0 +1,300 @@
+#include "cache.h"
+
+// ---------------------------------------------------------------------------
+// Dynamic I-RRIP for the L2C (Task 2B) with prefetch awareness (Task 3)
+//
+// Set dueling: DYN_LEADERS leader sets always run plain SRRIP. In these sets
+// we count instruction and total demand accesses and misses. Every
+// DYN_EPOCH leader accesses the follower sets choose their policy:
+//
+//      ratio = (instr accesses + instr misses) / (total accesses + total misses)
+//      ratio > DYN_THRESHOLD  ->  followers use I-RRIP, else SRRIP
+//
+// and the counters are halved, so old phases fade out. The ratio is measured
+// in SRRIP sets only: in I-RRIP sets the instruction misses would already be
+// reduced by the policy we are deciding about, which would bias the decision.
+//
+// DYN_MODE 1 replaces the ratio with a classic PSEL duel between SRRIP
+// leaders and I-RRIP leaders; an instruction miss moves PSEL by
+// DYN_INSTR_MISS_WEIGHT, a data miss by DYN_DATA_MISS_WEIGHT.
+//
+// Prefetch awareness (DYN_PF_AWARE, Task 3):
+//   * a prefetch fill of a data line is inserted at distant RRPV (DYN_PF_INS)
+//   * a prefetch request that hits does not promote the line
+//   * the first demand hit on a prefetched line promotes it only to
+//     DYN_PF_USE_RRPV, later hits promote as usual
+//   * victim choice among maxRRPV lines: unused prefetched data, then other
+//     data, then instruction lines
+//   * prefetch requests are not counted in the leader-set ratio, so prefetch
+//     traffic cannot dilute the instruction share and switch I-RRIP off
+// With no prefetcher, none of these paths is taken and the policy is exactly
+// the Task 2B policy.
+// ---------------------------------------------------------------------------
+
+#define maxRRPV 3
+
+// ---- I-RRIP rules (the values chosen in Task 2A) ----
+#ifndef IRRIP_INS_INSTR
+#define IRRIP_INS_INSTR 0
+#endif
+#ifndef IRRIP_INS_DATA
+#define IRRIP_INS_DATA 3
+#endif
+#ifndef IRRIP_DATA_PROMO_STEP
+#define IRRIP_DATA_PROMO_STEP 0
+#endif
+#ifndef IRRIP_WB_PROMOTE
+#define IRRIP_WB_PROMOTE 0
+#endif
+#ifndef IRRIP_DATA_FIRST_EVICT
+#define IRRIP_DATA_FIRST_EVICT 1
+#endif
+
+// ---- set dueling ----
+#ifndef DYN_MODE
+#define DYN_MODE 1                 // 0: instruction-ratio threshold, 1: PSEL duel
+#endif
+#ifndef DYN_LEADERS
+#define DYN_LEADERS 32             // SRRIP leader sets (power of two)
+#endif
+#ifndef DYN_THRESHOLD_PCT
+#define DYN_THRESHOLD_PCT 25       // threshold on the ratio, in percent
+#endif
+#ifndef DYN_EPOCH
+#define DYN_EPOCH 1024             // leader-set accesses between decisions
+#endif
+#define DYN_PSEL_BITS 10
+#ifndef DYN_INSTR_MISS_WEIGHT
+#define DYN_INSTR_MISS_WEIGHT 2    // DYN_MODE 1: PSEL step of an instruction miss
+#endif
+#ifndef DYN_DATA_MISS_WEIGHT
+#define DYN_DATA_MISS_WEIGHT 1     // DYN_MODE 1: PSEL step of a data miss
+#endif
+
+// ---- prefetch awareness ----
+#ifndef DYN_PF_AWARE
+#define DYN_PF_AWARE 1
+#endif
+#ifndef DYN_PF_INS
+#define DYN_PF_INS 3
+#endif
+#ifndef DYN_PF_USE_RRPV
+#define DYN_PF_USE_RRPV 0
+#endif
+#ifndef DYN_PF_EVICT_FIRST
+#define DYN_PF_EVICT_FIRST 1       // unused prefetched data lines are the first victims
+#endif
+#ifndef DYN_PF_IN_STATS
+#define DYN_PF_IN_STATS 0          // 1: prefetch requests are counted in the leader-set ratio
+#endif
+
+#define LOG2_L2C_SET 10
+#define DYN_CONSTITUENCY (L2C_SET / DYN_LEADERS)
+
+uint32_t l2_rrpv[L2C_SET][L2C_WAY];
+
+enum { SET_FOLLOWER = 0, SET_LEADER_RRIP = 1, SET_LEADER_IRRIP = 2 };
+static uint8_t  dyn_set_kind[L2C_SET];
+static uint8_t  dyn_use_irrip = 1;          // policy of the follower sets
+
+// leader-set counters (16-bit saturating in hardware; halved every epoch)
+static uint32_t dyn_i_acc = 0, dyn_i_miss = 0, dyn_t_acc = 0, dyn_t_miss = 0;
+static uint32_t dyn_epoch_cnt = 0;
+static uint32_t dyn_psel = 1 << (DYN_PSEL_BITS - 1);
+
+// statistics (not hardware)
+static uint64_t dyn_decisions = 0, dyn_decisions_irrip = 0;
+static double   dyn_ratio_sum = 0;
+static uint64_t dyn_pf_fills = 0, dyn_pf_first_use = 0;
+
+static inline uint8_t dyn_is_instr(uint32_t type, uint8_t isInstruction)
+{
+    return isInstruction && (type == LOAD || type == PREFETCH);
+}
+
+// does this set run I-RRIP rules right now?
+static inline uint8_t dyn_set_irrip(uint32_t set)
+{
+    if (dyn_set_kind[set] == SET_LEADER_RRIP)
+        return 0;
+    if (dyn_set_kind[set] == SET_LEADER_IRRIP)
+        return 1;
+    return dyn_use_irrip;
+}
+
+static void dyn_decide()
+{
+    uint8_t use;
+    if (DYN_MODE == 0) {
+        uint64_t num = dyn_i_acc + dyn_i_miss;
+        uint64_t den = dyn_t_acc + dyn_t_miss;
+        use = (den > 0) && (100 * num > (uint64_t)DYN_THRESHOLD_PCT * den);
+        if (warmup_complete[0] && den > 0)
+            dyn_ratio_sum += (double)num / den;
+    } else {
+        use = dyn_psel >= (1u << (DYN_PSEL_BITS - 1));
+    }
+    dyn_use_irrip = use;
+    if (warmup_complete[0]) {
+        dyn_decisions++;
+        dyn_decisions_irrip += use;
+    }
+    dyn_i_acc >>= 1;
+    dyn_i_miss >>= 1;
+    dyn_t_acc >>= 1;
+    dyn_t_miss >>= 1;
+}
+
+void CACHE::l2c_initialize_replacement()
+{
+    cout << "Initialize Dynamic I-RRIP state for L2C (mode " << DYN_MODE << ", leaders " << DYN_LEADERS
+         << ", threshold " << DYN_THRESHOLD_PCT << "%, epoch " << DYN_EPOCH << ", miss weights instr/data " << DYN_INSTR_MISS_WEIGHT << "/" << DYN_DATA_MISS_WEIGHT << ", pf aware " << DYN_PF_AWARE
+         << ", pf ins " << DYN_PF_INS << ", pf use " << DYN_PF_USE_RRPV
+         << ", pf evict first " << DYN_PF_EVICT_FIRST << ", pf in stats " << DYN_PF_IN_STATS << ")" << endl;
+
+    for (int i = 0; i < L2C_SET; i++)
+        for (int j = 0; j < L2C_WAY; j++)
+            l2_rrpv[i][j] = maxRRPV;
+
+    // complement-select: one leader per constituency of DYN_CONSTITUENCY sets,
+    // at offset = constituency number, so leaders are spread over the index
+    // space and do not line up with power-of-two strides
+    for (int s = 0; s < L2C_SET; s++) {
+        int constituency = s / DYN_CONSTITUENCY;
+        int offset = s % DYN_CONSTITUENCY;
+        dyn_set_kind[s] = SET_FOLLOWER;
+        if (offset == (constituency % DYN_CONSTITUENCY))
+            dyn_set_kind[s] = SET_LEADER_RRIP;
+        else if (DYN_MODE == 1 && offset == ((DYN_CONSTITUENCY - 1 - constituency) % DYN_CONSTITUENCY))
+            dyn_set_kind[s] = SET_LEADER_IRRIP;
+    }
+}
+
+uint32_t CACHE::l2c_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
+{
+    for (int i = 0; i < L2C_WAY; i++)
+        if (!current_set[i].valid)
+            return i;
+
+    uint8_t irrip = dyn_set_irrip(set);
+
+    while (1) {
+        // candidate classes at maxRRPV, best victim first
+        int pf_victim = -1, data_victim = -1, instr_victim = -1;
+        for (int i = 0; i < L2C_WAY; i++) {
+            if (l2_rrpv[set][i] != maxRRPV)
+                continue;
+            if (DYN_PF_AWARE && DYN_PF_EVICT_FIRST && current_set[i].prefetch && !current_set[i].instruction) {
+                if (pf_victim < 0) pf_victim = i;
+            } else if (!current_set[i].instruction) {
+                if (data_victim < 0) data_victim = i;
+            } else {
+                if (instr_victim < 0) instr_victim = i;
+            }
+        }
+        if (pf_victim >= 0)
+            return pf_victim;
+        if (!(irrip && IRRIP_DATA_FIRST_EVICT)) {
+            // plain SRRIP: lowest way at maxRRPV
+            for (int i = 0; i < L2C_WAY; i++)
+                if (l2_rrpv[set][i] == maxRRPV)
+                    return i;
+        } else {
+            if (data_victim >= 0)
+                return data_victim;
+            if (instr_victim >= 0)
+                return instr_victim;
+        }
+
+        for (int i = 0; i < L2C_WAY; i++)
+            l2_rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+void CACHE::l2c_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit, uint8_t isInstruction)
+{
+    if ((type == WRITEBACK) && ip)
+        assert(0);
+
+    uint8_t instr = dyn_is_instr(type, isInstruction);
+    uint8_t kind = dyn_set_kind[set];
+
+    // ---- set-dueling bookkeeping (demand traffic only) ----
+    uint8_t demand = (type != WRITEBACK) && !(DYN_PF_AWARE && !DYN_PF_IN_STATS && type == PREFETCH);
+    if (kind == SET_LEADER_RRIP && demand) {
+        dyn_t_acc++;
+        if (instr) dyn_i_acc++;
+        if (!hit) {
+            dyn_t_miss++;
+            if (instr) dyn_i_miss++;
+        }
+    }
+    if (DYN_MODE == 1 && !hit && demand) {
+        int32_t max_psel = (1 << DYN_PSEL_BITS) - 1;
+        int32_t w = instr ? DYN_INSTR_MISS_WEIGHT : DYN_DATA_MISS_WEIGHT;
+        int32_t p = (int32_t)dyn_psel;
+        if (kind == SET_LEADER_RRIP)
+            p += w;                        // a miss under SRRIP votes for I-RRIP
+        else if (kind == SET_LEADER_IRRIP)
+            p -= w;
+        dyn_psel = (uint32_t)std::max(0, std::min(max_psel, p));
+    }
+    if (kind == SET_LEADER_RRIP && demand && ++dyn_epoch_cnt >= DYN_EPOCH) {
+        dyn_epoch_cnt = 0;
+        dyn_decide();
+    }
+
+    uint8_t irrip = dyn_set_irrip(set);
+
+    // ---- prefetch awareness ----
+    if (DYN_PF_AWARE && type == PREFETCH && !instr) {
+        if (!hit) {
+            l2_rrpv[set][way] = DYN_PF_INS;
+            dyn_pf_fills++;
+        }
+        return;                            // a prefetch hit is not a reuse
+    }
+    if (DYN_PF_AWARE && hit && type != WRITEBACK && block[set][way].prefetch && !instr) {
+        // first demand use of a prefetched line (the prefetch bit is cleared
+        // by the cache right after this call)
+        dyn_pf_first_use++;
+        if (l2_rrpv[set][way] > DYN_PF_USE_RRPV)
+            l2_rrpv[set][way] = DYN_PF_USE_RRPV;
+        return;
+    }
+
+    if (!irrip) {
+        // SRRIP
+        if (hit)
+            l2_rrpv[set][way] = 0;
+        else
+            l2_rrpv[set][way] = maxRRPV - 1;
+        return;
+    }
+
+    // I-RRIP
+    if (hit) {
+        if (type == WRITEBACK && !IRRIP_WB_PROMOTE)
+            return;
+        if (instr || IRRIP_DATA_PROMO_STEP == 0)
+            l2_rrpv[set][way] = 0;
+        else if (l2_rrpv[set][way] > IRRIP_DATA_PROMO_STEP)
+            l2_rrpv[set][way] -= IRRIP_DATA_PROMO_STEP;
+        else
+            l2_rrpv[set][way] = 0;
+        return;
+    }
+    l2_rrpv[set][way] = instr ? IRRIP_INS_INSTR : IRRIP_INS_DATA;
+}
+
+void CACHE::l2c_replacement_final_stats()
+{
+    cout << "DYN_IRRIP decisions: " << dyn_decisions << " irrip_decisions: " << dyn_decisions_irrip
+         << " irrip_fraction: " << (dyn_decisions ? (double)dyn_decisions_irrip / dyn_decisions : 0)
+         << " mean_ratio: " << (dyn_decisions ? dyn_ratio_sum / dyn_decisions : 0) << endl;
+    cout << "DYN_IRRIP pf_fills: " << dyn_pf_fills << " pf_first_use: " << dyn_pf_first_use << endl;
+}
