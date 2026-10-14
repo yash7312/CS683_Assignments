@@ -1,0 +1,7 @@
+bin/
+obj/
+build_logs/
+*.tmp
+*.champsimtrace.*
+traces/
+__pycache__/
