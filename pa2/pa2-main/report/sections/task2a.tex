@@ -1,0 +1,159 @@
+% ====================================================================== Task 2A
+\clearpage
+\section{Task 2A: Instruction-Conscious L2 Replacement (I-RRIP)}
+
+\subsection{Why protect instruction lines in the L2?}
+When a load misses in the L1D and hits in the L2, it waits about 10 extra cycles, and the out-of-order core
+(352-entry ROB) can usually hide much of that by working on other instructions. An L1I miss is different: fetch
+stops until the line arrives, so the delay goes almost straight into execution time.
+
+Our traces have large code footprints. Even with SRRIP the L2 instruction load MPKI is 10.55, 19.32 and 1.20, and
+on Trace2 instruction misses are 71\% of all L2 load misses. Keeping instruction lines in the L2 turns these
+expensive front-end stalls into short L2 hits. The price is some extra data misses, which the core partly hides anyway.
+
+\subsection{Design}
+I-RRIP keeps the SRRIP hardware: a 2-bit re-reference prediction value (RRPV) per line, the victim is a line with
+RRPV\,3, and if no line has RRPV\,3 every line of the set ages by one. I-RRIP changes all three parts of the policy:
+
+\begin{table}[H]\centering\small
+\begin{tabularx}{\textwidth}{@{}l>{\raggedright\arraybackslash}p{40mm}>{\raggedright\arraybackslash}X@{}}
+\toprule
+Part & SRRIP & I-RRIP \\
+\midrule
+Insertion & every line at RRPV 2               & instruction line at RRPV \textbf{0}, data line at RRPV \textbf{3} \\
+Promotion & every hit $\to$ RRPV 0             & demand hits (instruction and data) $\to$ RRPV 0; \textbf{a writeback hit does not promote} \\
+Eviction  & first line (lowest way) with RRPV 3 & among lines with RRPV 3, \textbf{a data line before an instruction line} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\textbf{Hardware cost over SRRIP:} one instruction bit per line, i.e.\ 8192 bits for the 512\,KB L2 (ChampSim already
+keeps it in \code{BLOCK::instruction}). Everything else is just different constants and one extra comparison in
+the victim search.
+
+\subsection{How each part was chosen: ablation}
+Starting from SRRIP, we changed one part at a time and kept a change only if it raised the geometric-mean speedup
+by more than 0.05\%. Smaller gaps count as ties, the same rule as in Task 1. Table~\ref{tab:t2a-abl} lists every
+variant and Figure~\ref{fig:t2a-abl} plots their geometric-mean speedups.
+
+\begin{table}[H]\centering\small
+\setlength{\tabcolsep}{3.6pt}
+\begin{tabular}{@{}lccccccccccc@{}}
+\toprule
+Name & \makecell{Instr.\\insert} & \makecell{Data\\insert} & \makecell{Data\\hit} & \makecell{WB\\hit} & Victim
+     & \makecell{Speedup\\T1} & \makecell{Speedup\\T2} & \makecell{Speedup\\T3} & Geomean
+     & \makecell{L2 instr.\\MPKI (mean)} & \makecell{L2 data\\MPKI (mean)} \\
+\midrule
+SRRIP & 2 & 2 & $\to$0 & $\to$0 & first at 3 & 0.9996 & 1.0020 & 0.9990 & 1.0002 & 10.36 & 5.95 \\
+A1    & 1 & 2 & $\to$0 & $\to$0 & first at 3 & 1.0004 & 1.0064 & 0.9996 & 1.0021 & 9.90 & 6.18 \\
+A2    & 0 & 2 & $\to$0 & $\to$0 & first at 3 & 0.9996 & 1.0097 & 0.9998 & 1.0030 & 9.65 & 6.37 \\
+A3    & 1 & 3 & $\to$0 & $\to$0 & first at 3 & 0.9974 & 1.0201 & 0.9998 & 1.0057 & 8.19 & 7.26 \\
+A4    & 0 & 3 & $\to$0 & $\to$0 & first at 3 & 0.9970 & 1.0216 & 1.0000 & 1.0061 & 8.07 & 7.39 \\
+P1    & 0 & 2 & $-1$   & $\to$0 & first at 3 & 0.9992 & 1.0136 & 1.0001 & 1.0043 & 9.18 & 6.55 \\
+P2    & 0 & 3 & $-1$   & $\to$0 & first at 3 & 0.9964 & 1.0238 & 1.0015 & 1.0072 & 7.70 & 7.61 \\
+P3    & 0 & 2 & $\to$0 & none   & first at 3 & 0.9990 & 1.0138 & 1.0004 & 1.0044 & 9.16 & 6.44 \\
+P4    & 0 & 3 & $\to$0 & none   & first at 3 & 0.9974 & 1.0267 & 1.0046 & 1.0095 & 7.71 & 7.56 \\
+P5    & 0 & 3 & $-1$   & none   & first at 3 & 0.9963 & 1.0269 & 1.0059 & 1.0096 & 7.50 & 7.80 \\
+E1    & 0 & 2 & $\to$0 & $\to$0 & data first & 0.9989 & 1.0162 & 0.9999 & 1.0050 & 9.01 & 6.57 \\
+E2    & 0 & 3 & $\to$0 & $\to$0 & data first & 0.9961 & 1.0225 & 1.0000 & 1.0061 & 7.70 & 7.71 \\
+E3    & 0 & 2 & $\to$0 & none   & data first & 0.9987 & 1.0188 & 1.0004 & 1.0059 & 8.65 & 6.62 \\
+\chosen{I-RRIP} & 0 & 3 & $\to$0 & none & data first & 0.9962 & 1.0276 & 1.0050 & 1.0095 & 7.44 & 7.91 \\
+E4    & 0 & 3 & $-1$   & none   & data first & 0.9956 & 1.0271 & 1.0061 & 1.0095 & 7.44 & 7.91 \\
+\bottomrule
+\end{tabular}
+\caption{I-RRIP ablation. The insert columns are RRPVs. ``Data hit'' $\to$0 means promotion to RRPV 0, $-1$ means one
+step closer. ``WB hit'' is the promotion on a writeback hit. Speedup is over LRU. Highlighted: the submitted I-RRIP.}
+\label{tab:t2a-abl}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[base, xbar, width=0.8\textwidth, height=72mm, bar width=6.5pt,
+  ymajorgrids=false, xmajorgrids,
+  y dir=reverse, ytick={0,...,14},
+  yticklabels={SRRIP,A1,A2,A3,A4,P1,P2,P3,P4,P5,E1,E2,E3,I-RRIP,E4},
+  ytick style={draw=none}, enlarge y limits={abs=0.6},
+  xmin=0.998, xmax=1.0112, xtick distance=0.002,
+  xticklabel style={/pgf/number format/.cd, fixed, fixed zerofill, precision=3},
+  xlabel={Geometric-mean speedup over LRU (3 traces)},
+  nodes near coords, nodes near coords align={horizontal},
+  every node near coord/.append style={font=\scriptsize, /pgf/number format/.cd, fixed, fixed zerofill, precision=4},
+  clip=false]
+  \addplot[bBlue, bar shift=0pt] coordinates {
+    (1.0002,0) (1.0021,1) (1.0030,2) (1.0057,3) (1.0061,4) (1.0043,5) (1.0072,6)
+    (1.0044,7) (1.0095,8) (1.0096,9) (1.0050,10) (1.0061,11) (1.0059,12) (1.0095,14)};
+  \addplot[bOrange, bar shift=0pt] coordinates {(1.0095,13)};
+  \draw[black!75, dashed, thin] (axis cs:1,14.6) -- (axis cs:1,-0.6) node[above, font=\scriptsize, black!75] {LRU};
+\end{axis}
+\end{tikzpicture}
+\caption{Geometric-mean speedup over LRU of every ablation variant (dashed line: LRU). Orange: the submitted I-RRIP.}
+\label{fig:t2a-abl}
+\end{figure}
+
+\textbf{Insertion.} Inserting instruction lines at RRPV 0 instead of 2 helps (A2: $+0.30\%$), because they survive
+two more aging rounds before they can be evicted. RRPV 1 protects them less and is worse (A1: $+0.21\%$). The bigger
+step is inserting data at RRPV 3 (A4: $+0.61\%$, A3: $+0.57\%$): a new data line then becomes the first victim of its
+set unless it is reused before the next miss. This is a safe bet, because most L2 data lines are never reused
+before eviction (the L2 load hit rate of SRRIP is only 30\%, 49\% and 27\%). Little useful data is lost and
+the space goes to instructions. We keep both changes: instructions at 0, data at 3.
+
+\textbf{Promotion.} We tested two changes. Promoting a data hit by only one step (P1, P2) helps a little on its own
+(A4 $\to$ P2: $+0.61\% \to +0.72\%$). The most important single change, however, is \emph{not promoting on a
+writeback hit} (A4 $\to$ P4: $+0.61\% \to +0.95\%$). Writebacks are dirty lines that the L1D has just evicted. They
+are 11--25\% of all L2 accesses, and over 92\% of them hit in the L2 because the line is still there from its fill.
+SRRIP moves each such line to RRPV 0, so the line the L1D just threw away gets the highest priority in the L2, ahead
+of every instruction line. A writeback is not a reuse by the core, so it should not change the prediction.
+Once writebacks stop promoting, one-step data promotion adds nothing (P4 $+0.95\%$ vs P5 $+0.96\%$, a tie), so
+demand hits keep the simpler SRRIP rule ($\to$ RRPV 0): a data line that really is reused deserves to stay.
+
+\textbf{Eviction.} Picking a data line before an instruction line among the RRPV-3 candidates matters when both kinds
+reach RRPV 3 together. This is common when data is inserted at 2 (A2 $\to$ E1: $+0.30\% \to +0.50\%$). With data
+inserted at 3, most RRPV-3 lines are data lines already, and the speedup gain is a tie (P4 $+0.95\%$ vs I-RRIP
+$+0.95\%$). We keep the rule anyway: it is the only part that protects an \emph{old} instruction line, and it
+lowers the L2 instruction MPKI further, which is the stated goal of the task (Trace2: 12.98 $\to$ 12.33). It costs
+nothing beyond the instruction bit.
+
+\textbf{Final choice.} I-RRIP ties for the highest geometric-mean speedup with P4, P5 and E4 (all within 0.01\%), and
+together with E4 it has the lowest mean L2 instruction MPKI. E4 only adds one-step data promotion, which brings no
+gain, so we submit the simpler I-RRIP. The cost is visible on Trace1, the trace whose data is reused in the L2:
+its data MPKI rises from 7.06 to 9.63 and its speedup drops to 0.9962. Task 2B fixes this.
+
+\subsection{Results}
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Configuration & IPC & Speedup & L2C load MPKI & L2 instr.\ load MPKI & L2 data load MPKI \\
+\midrule
+\grp{6}{Trace1}
+LRU (baseline)   & 0.2321 & 1.0000 & 17.70 & 10.37 & 7.33 \\
+SRRIP            & 0.2320 & 0.9996 & 17.61 & 10.55 & 7.06 \\
+\chosen{I-RRIP}  & 0.2312 & 0.9962 & 18.88 & 9.25  & 9.63 \\
+\midrule
+\grp{6}{Trace2}
+LRU (baseline)   & 0.2499 & 1.0000 & 28.64 & 20.14 & 8.50 \\
+SRRIP            & 0.2504 & 1.0020 & 27.27 & 19.32 & 7.95 \\
+\chosen{I-RRIP}  & 0.2568 & 1.0276 & 23.25 & 12.33 & 10.92 \\
+\midrule
+\grp{6}{Trace3}
+LRU (baseline)   & 0.3820 & 1.0000 & 3.96 & 1.12 & 2.84 \\
+SRRIP            & 0.3816 & 0.9990 & 4.04 & 1.20 & 2.85 \\
+\chosen{I-RRIP}  & 0.3839 & 1.0050 & 3.90 & 0.73 & 3.17 \\
+\midrule
+\grp{6}{Average (geometric mean for IPC and speedup, arithmetic mean otherwise)}
+LRU (baseline)   & 0.2809 & 1.0000 & 16.77 & 10.54 & 6.22 \\
+SRRIP            & 0.2809 & 1.0002 & 16.31 & 10.36 & 5.95 \\
+\chosen{I-RRIP}  & 0.2836 & 1.0095 & 15.34 & 7.44  & 7.91 \\
+\bottomrule
+\end{tabular}
+\caption{Task 2A: IPC, speedup over LRU and L2 load MPKIs (no prefetcher).}
+\label{tab:t2a-res}
+\end{table}
+
+\replfig{lru,srrip,irrip}{LRU (baseline),SRRIP,I-RRIP}{leg:t2a}{5pt}
+  {Task 2A: speedup and L2C / L2 instruction / L2 data load MPKI of LRU, SRRIP and I-RRIP.}{fig:t2a-res}
+
+I-RRIP lowers the mean L2 instruction load MPKI from 10.36 (SRRIP) to 7.44, i.e.\ 28\% fewer instruction misses,
+while the data load MPKI rises from 5.95 to 7.91. On Trace2, where instructions cause most L2 misses, this gives
+a $+2.76\%$ speedup over LRU, and the total L2 load MPKI falls as well. On Trace3 the instruction misses almost
+disappear (1.20 $\to$ 0.73). On Trace1 the extra data misses outweigh the saved instruction misses.

@@ -1,0 +1,251 @@
+% ====================================================================== Task 3
+\clearpage
+\section{Task 3: SPP with Prefetch-Aware Dynamic I-RRIP}
+
+\subsection{What the L2 sees from SPP}
+SPP (Task 1) sits at the L1D. Each prefetch first looks up the L1D. If it misses there, it goes to the L2 as a
+\code{PREFETCH} request, and if it misses in the L2 too, the line is filled into the L2 on its way to the L1D.
+(SPP fills the L1D when fewer than half of the L1D MSHRs are busy; otherwise it fills only the L2.) So the replacement
+policy sees three new events:
+\begin{itemize}
+  \item a prefetch fill,
+  \item a prefetch request that hits a line already in the L2, and
+  \item later, perhaps, a demand hit on a line that a prefetch brought in (\code{BLOCK::prefetch} is still set; the
+        cache clears it right after calling the policy).
+\end{itemize}
+Counting these events shows that only 2.3\% / 0.8\% / 0.9\% of the prefetched lines filled into the L2 ever get a
+demand hit at the L2 (columns \emph{pf fills} and \emph{first use} in Table~\ref{tab:t3-var}, counted over warm-up and
+simulation). Useful prefetches are consumed in the L1D. The L2 copy is a duplicate that the program will not ask the L2
+for again unless the L1D loses it first.
+
+\subsection{Prefetch-aware design}
+The prefetch handling is part of \code{replacement/dyn\_irrip.l2c\_repl} (\code{DYN\_PF\_AWARE}, on by default). It
+applies to data prefetches in all sets and in both follower modes:
+\begin{enumerate}
+  \item \textbf{Insertion:} a prefetch fill is inserted at RRPV 3 (distant). A prefetch is a guess, not a demand, and
+        it will most likely be used in the L1D. In I-RRIP mode data gets RRPV 3 anyway; in SRRIP mode (Trace1) this
+        stops prefetched lines from pushing out demand data inserted at 2.
+  \item \textbf{No promotion on a prefetch hit:} a prefetch request that hits in the L2 is about to copy the line into
+        the L1D, which says nothing about future L2 reuse. SRRIP and I-RRIP would move the line to RRPV 0.
+  \item \textbf{First demand use:} the first demand hit on a prefetched line proves the prefetch right, so the line is
+        promoted to RRPV 0 like any reused line.
+  \item \textbf{Eviction:} among the RRPV-3 candidates, an unused prefetched data line is evicted first, then other
+        data, then instructions.
+  \item \textbf{Set dueling sees demand traffic only:} prefetch misses are not counted in PSEL (or in the mode-0 ratio).
+        Prefetch traffic depends on the prefetcher, not on how well a replacement policy keeps instruction or data
+        lines. Counting it would add data misses to both leader groups and dilute the instruction-miss signal the duel
+        relies on.
+\end{enumerate}
+None of this needs new state: \code{BLOCK::prefetch} already exists in every cache line. With no prefetcher none of
+these paths runs, so the Task 2B results are exactly the results of this file.
+
+\subsection{Choosing the L2 policy and the prefetch rules}
+\begin{table}[H]\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lcccccccc@{}}
+\toprule
+Configuration (SPP at L1D) & \makecell{Speedup\\Trace1} & \makecell{Speedup\\Trace2} & \makecell{Speedup\\Trace3}
+  & \makecell{Geomean\\speedup} & \makecell{L1D\\acc.\ (\%)} & \makecell{L2 instr.\\MPKI} & \makecell{L2 data\\MPKI}
+  & \makecell{pf fills /\\first use} \\
+\midrule
+SPP + LRU                     & 1.0083 & 1.0135 & 1.0126 & 1.0115 & 54.0 & 10.58 & 5.59 & \na \\
+SPP + SRRIP                   & 1.0081 & 1.0155 & 1.0120 & 1.0118 & 54.2 & 10.39 & 5.32 & \na \\
+SPP + I-RRIP                  & 1.0055 & 1.0412 & 1.0177 & 1.0214 & 53.8 & 7.46  & 7.18 & \na \\
+SPP + Dyn-I-RRIP (pf-unaware) & 1.0080 & 1.0404 & 1.0176 & 1.0219 & 54.0 & 7.97  & 6.38 & \na \\
+\midrule
+PF-aware: insert pf at 2      & 1.0079 & 1.0365 & 1.0146 & 1.0196 & 54.2 & 8.08  & 6.31 & 230709 / 8087 \\
+PF-aware: first use to 1      & 1.0079 & 1.0405 & 1.0181 & 1.0221 & 54.0 & 7.95  & 6.37 & 241248 / 3308 \\
+PF-aware: first use to 2      & 1.0079 & 1.0405 & 1.0180 & 1.0220 & 54.0 & 7.94  & 6.38 & 240974 / 3266 \\
+PF-aware: no pf-first evict   & 1.0077 & 1.0405 & 1.0183 & 1.0221 & 54.1 & 7.94  & 6.38 & 240007 / 3430 \\
+PF-aware: pf in PSEL          & 1.0077 & 1.0405 & 1.0125 & 1.0201 & 54.2 & 8.05  & 6.31 & 237208 / 3491 \\
+\chosen{SPP + Dyn-I-RRIP-PF}  & 1.0079 & 1.0406 & 1.0180 & 1.0221 & 54.1 & 7.94  & 6.38 & 241044 / 3357 \\
+\bottomrule
+\end{tabular}
+\caption{SPP combined with each L2 policy, and the prefetch-aware variants (one rule changed at a time). Speedup is over
+the baseline without prefetcher and with LRU. Accuracy and MPKI are means over the traces. pf fills / first use:
+prefetch fills into the L2 and first demand uses of such lines, summed over the traces. Highlighted: submitted.}
+\label{tab:t3-var}
+\end{table}
+
+\textbf{Policy.} With SPP added, the L2 policies keep their Task 2 order: SRRIP $+1.18\%$, I-RRIP $+2.14\%$ and
+prefetch-unaware Dyn-I-RRIP $+2.19\%$ (SPP + LRU: $+1.15\%$). The instruction-miss savings of I-RRIP add on top of the
+data-miss savings of SPP. Dyn-I-RRIP beats static I-RRIP with SPP as well, again by leaving Trace1 on SRRIP
+(Trace1: 1.0080 vs 1.0055).
+
+\textbf{Prefetch rules, one at a time.} The complete prefetch-aware policy ($+2.21\%$) and the prefetch-unaware one
+($+2.19\%$) are a tie. Since I-RRIP already inserts every data line at RRPV 3, prefetched or not, most prefetch rules
+repeat what the unaware policy does in I-RRIP mode anyway. Removing single rules from the aware policy shows which
+ones carry weight:
+\begin{itemize}
+  \item \textbf{Distant insertion matters.} Inserting prefetches at RRPV 2 instead of 3 costs 0.24\%. The prefetched
+        lines then outlive other data lines and push out instruction lines: the L2 instruction MPKI rises on Trace2
+        (12.59 $\to$ 12.90) and Trace3 (0.75 $\to$ 0.85).
+  \item \textbf{Keeping prefetches out of the duel matters.} Counting prefetch misses in PSEL costs 0.19\%. These
+        extra misses are data misses that both leader groups suffer alike, so they add noise but no signal. On Trace3,
+        which has few L2 demand misses, they drag PSEL towards SRRIP (I-RRIP chosen in 0.43 of the decisions instead of 1.00).
+  \item \textbf{First-use promotion and prefetch-first eviction are ties} (promotion to RRPV 1: $+2.21\%$, to RRPV 2:
+        $+2.20\%$, no prefetch-first eviction: $+2.21\%$, vs $+2.21\%$). Only 2.3\% / 0.8\% / 0.9\% of the
+        prefetched lines are ever used at the L2, so the first-use rule rarely runs. And with data inserted at RRPV 3,
+        the RRPV-3 candidates are nearly always prefetched or other dead data lines anyway. We keep both rules because
+        they are free and follow the same reasoning, but the data does not show that they help.
+\end{itemize}
+
+\subsection{Results}
+\begin{table}[H]\centering\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lcccccccc@{}}
+\toprule
+Configuration & IPC & Speedup & \makecell{L1D\\accuracy (\%)} & \makecell{L1D\\coverage (\%)} & \makecell{L1D load\\MPKI}
+  & \makecell{L2C load\\MPKI} & \makecell{L2 instr.\\MPKI} & \makecell{L2 data\\MPKI} \\
+\midrule
+\grp{9}{Trace1}
+Baseline (no pf, LRU)        & 0.2321 & 1.0000 & \na  & \na  & 10.68 & 17.70 & 10.37 & 7.33 \\
+SPP + LRU                    & 0.2341 & 1.0083 & 57.6 & 9.42 & 9.67  & 16.91 & 10.42 & 6.50 \\
+Dyn-I-RRIP (no pf)           & 0.2320 & 0.9993 & \na  & \na  & 10.68 & 17.68 & 10.54 & 7.14 \\
+SPP + Dyn-I-RRIP             & 0.2340 & 1.0080 & 57.9 & 9.47 & 9.67  & 16.86 & 10.55 & 6.31 \\
+\chosen{SPP + Dyn-I-RRIP-PF} & 0.2340 & 1.0079 & 57.9 & 9.46 & 9.67  & 16.76 & 10.49 & 6.27 \\
+\midrule
+\grp{9}{Trace2}
+Baseline (no pf, LRU)        & 0.2499 & 1.0000 & \na  & \na  & 13.54 & 28.64 & 20.14 & 8.50 \\
+SPP + LRU                    & 0.2533 & 1.0135 & 63.2 & 4.46 & 12.93 & 28.10 & 20.19 & 7.91 \\
+Dyn-I-RRIP (no pf)           & 0.2566 & 1.0268 & \na  & \na  & 13.55 & 23.33 & 12.53 & 10.79 \\
+SPP + Dyn-I-RRIP             & 0.2600 & 1.0404 & 63.6 & 4.37 & 12.94 & 22.78 & 12.60 & 10.18 \\
+\chosen{SPP + Dyn-I-RRIP-PF} & 0.2601 & 1.0406 & 63.6 & 4.39 & 12.94 & 22.78 & 12.59 & 10.19 \\
+\midrule
+\grp{9}{Trace3}
+Baseline (no pf, LRU)        & 0.3820 & 1.0000 & \na  & \na   & 3.40 & 3.96 & 1.12 & 2.84 \\
+SPP + LRU                    & 0.3868 & 1.0126 & 41.0 & 10.44 & 3.05 & 3.50 & 1.13 & 2.37 \\
+Dyn-I-RRIP (no pf)           & 0.3838 & 1.0048 & \na  & \na   & 3.40 & 3.91 & 0.75 & 3.16 \\
+SPP + Dyn-I-RRIP             & 0.3887 & 1.0176 & 40.6 & 10.50 & 3.05 & 3.42 & 0.76 & 2.66 \\
+\chosen{SPP + Dyn-I-RRIP-PF} & 0.3889 & 1.0180 & 40.8 & 10.58 & 3.04 & 3.41 & 0.75 & 2.66 \\
+\midrule
+\grp{9}{Average (geometric mean for IPC and speedup, arithmetic mean otherwise)}
+Baseline (no pf, LRU)        & 0.2809 & 1.0000 & \na  & \na  & 9.21 & 16.77 & 10.54 & 6.22 \\
+SPP + LRU                    & 0.2841 & 1.0115 & 54.0 & 8.10 & 8.55 & 16.17 & 10.58 & 5.59 \\
+Dyn-I-RRIP (no pf)           & 0.2838 & 1.0102 & \na  & \na  & 9.21 & 14.97 & 7.94  & 7.03 \\
+SPP + Dyn-I-RRIP             & 0.2870 & 1.0219 & 54.0 & 8.11 & 8.55 & 14.35 & 7.97  & 6.38 \\
+\chosen{SPP + Dyn-I-RRIP-PF} & 0.2871 & 1.0221 & 54.1 & 8.15 & 8.55 & 14.32 & 7.94  & 6.38 \\
+\bottomrule
+\end{tabular}
+\caption{Task 3: IPC, speedup over the baseline (no prefetcher, LRU), L1D prefetch accuracy and coverage, and load MPKI
+of the L1D, L2C, L2 instructions and L2 data. Accuracy and coverage are undefined without a prefetcher (\na).}
+\label{tab:t3-res}
+\end{table}
+
+% Columns: base spplru dyn sppdyn pf
+\pgfplotstableread{
+g       base   spplru dyn    sppdyn pf
+Trace1  0.2321 0.2341 0.2320 0.2340 0.2340
+Trace2  0.2499 0.2533 0.2566 0.2600 0.2601
+Trace3  0.3820 0.3868 0.3838 0.3887 0.3889
+Average 0.2809 0.2841 0.2838 0.2870 0.2871
+}\tTIpc
+\pgfplotstableread{
+g       base   spplru dyn    sppdyn pf
+Trace1  1.0000 1.0083 0.9993 1.0080 1.0079
+Trace2  1.0000 1.0135 1.0268 1.0404 1.0406
+Trace3  1.0000 1.0126 1.0048 1.0176 1.0180
+Average 1.0000 1.0115 1.0102 1.0219 1.0221
+}\tTSpd
+\pgfplotstableread{
+g       base spplru dyn  sppdyn pf
+Trace1  nan  57.6   nan  57.9   57.9
+Trace2  nan  63.2   nan  63.6   63.6
+Trace3  nan  41.0   nan  40.6   40.8
+Average nan  54.0   nan  54.0   54.1
+}\tTAcc
+\pgfplotstableread{
+g       base spplru dyn  sppdyn pf
+Trace1  nan  9.42   nan  9.47   9.46
+Trace2  nan  4.46   nan  4.37   4.39
+Trace3  nan  10.44  nan  10.50  10.58
+Average nan  8.10   nan  8.11   8.15
+}\tTCov
+\pgfplotstableread{
+g       base  spplru dyn   sppdyn pf
+Trace1  10.68 9.67   10.68 9.67   9.67
+Trace2  13.54 12.93  13.55 12.94  12.94
+Trace3  3.40  3.05   3.40  3.05   3.04
+Average 9.21  8.55   9.21  8.55   8.55
+}\tTLtd
+\pgfplotstableread{
+g       base  spplru dyn   sppdyn pf
+Trace1  17.70 16.91  17.68 16.86  16.76
+Trace2  28.64 28.10  23.33 22.78  22.78
+Trace3  3.96  3.50   3.91  3.42   3.41
+Average 16.77 16.17  14.97 14.35  14.32
+}\tTLoad
+\pgfplotstableread{
+g       base  spplru dyn   sppdyn pf
+Trace1  10.37 10.42  10.54 10.55  10.49
+Trace2  20.14 20.19  12.53 12.60  12.59
+Trace3  1.12  1.13   0.75  0.76   0.75
+Average 10.54 10.58  7.94  7.97   7.94
+}\tTInstr
+\pgfplotstableread{
+g       base  spplru dyn   sppdyn pf
+Trace1  7.33  6.50   7.14  6.31   6.27
+Trace2  8.50  7.91   10.79 10.18  10.19
+Trace3  2.84  2.37   3.16  2.66   2.66
+Average 6.22  5.59   7.03  6.38   6.38
+}\tTData
+\newcommand{\tcols}{base,spplru,dyn,sppdyn,pf}
+\newcommand{\topts}{cycle list name=tthree, bar width=3.6pt, height=42mm}
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tTIpc}{\tcols}{\topts, ymin=0, ymax=0.42, ylabel={IPC},
+    legend entries={{Baseline (no pf, LRU)},SPP + LRU,Dyn-I-RRIP (no pf),SPP + Dyn-I-RRIP,SPP + Dyn-I-RRIP-PF},
+    legend columns=3, legend to name=leg:t3}
+  \caption{IPC}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tTSpd}{\tcols}{\topts, ymin=0.99, ymax=1.045, ylabel={Speedup over baseline}, speedline}
+  \caption{Speedup over baseline}
+\end{subfigure}\\[4pt]
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tTAcc}{\tcols}{\topts, ymin=0, ymax=70, ylabel={L1D accuracy (\%)}}
+  \caption{L1D prefetch accuracy}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tTCov}{\tcols}{\topts, ymin=0, ymax=12, ylabel={L1D coverage (\%)}}
+  \caption{L1D prefetch coverage}
+\end{subfigure}\\[4pt]
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tTLtd}{\tcols}{\topts, ymin=0, ymax=15, ylabel={L1D load MPKI}}
+  \caption{L1D load MPKI}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tTLoad}{\tcols}{\topts, ymin=0, ymax=30, ylabel={L2C load MPKI}}
+  \caption{L2C load MPKI}
+\end{subfigure}\\[4pt]
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tTInstr}{\tcols}{\topts, ymin=0, ymax=22, ylabel={L2 instr.\ load MPKI}}
+  \caption{L2 instruction load MPKI}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tTData}{\tcols}{\topts, ymin=0, ymax=12, ylabel={L2 data load MPKI}}
+  \caption{L2 data load MPKI}
+\end{subfigure}\\[3pt]
+\ref*{leg:t3}
+\caption{Task 3: every metric of Table~\ref{tab:t3-res}. The last group is the average (geometric mean for IPC and
+speedup). Configurations without a prefetcher have no accuracy or coverage bars.}
+\label{fig:t3-res}
+\end{figure}
+
+\textbf{Outcome.} SPP + prefetch-aware Dyn-I-RRIP reaches a geometric-mean speedup of $\boldsymbol{+2.21\%}$, against
+$+1.15\%$ for SPP alone (with LRU) and $+1.02\%$ for Dyn-I-RRIP without prefetching, so it beats both. Per trace:
+\begin{itemize}
+  \item Trace1: 1.0079 vs 1.0083 (SPP) and 0.9993 (Dyn-I-RRIP);
+  \item Trace2: 1.0406 vs 1.0135 (SPP) and 1.0268 (Dyn-I-RRIP);
+  \item Trace3: 1.0180 vs 1.0126 (SPP) and 1.0048 (Dyn-I-RRIP).
+\end{itemize}
+The two mechanisms remove different misses, so their gains add up. SPP removes L1D data misses (coverage 8.1\%, L1D
+load MPKI 9.21 $\to$ 8.55), and Dyn-I-RRIP removes L2 instruction misses (mean 10.58 $\to$ 7.94), which SPP cannot
+touch. On Trace1, where the duel keeps SRRIP, the result stays within 0.04\% of SPP + LRU: the L2 policy has almost no
+effect on that trace (LRU and SRRIP differ by 0.04\% there as well).
+
+\textbf{SPP accuracy and coverage} stay the same with every L2 policy (accuracy 54.0\% vs 54.1\%, coverage 8.10\% vs
+8.15\% for SPP + LRU vs the submitted combination). The L2 policy does not change what SPP predicts, only how long the
+L2 keeps the lines.

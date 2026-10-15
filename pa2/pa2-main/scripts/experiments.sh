@@ -1,12 +1,5 @@
 #!/bin/bash
-# Every configuration used in the report for Tasks 2 and 3.
-#
-#   scripts/experiments.sh build                  build all binaries into bin/
-#   scripts/experiments.sh run <trace_dir> <results_dir> [tag ...]
-#                                                 run them (25M + 25M) on all traces
-#
-# A tag is one binary. Policy parameters are compile-time macros of
-# replacement/irrip.l2c_repl and replacement/dyn_irrip.l2c_repl (see build.sh).
+
 cd "$(dirname "$0")/.."
 
 CONFIGS=(

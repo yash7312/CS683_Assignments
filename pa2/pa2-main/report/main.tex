@@ -1,0 +1,37 @@
+% CS683 PA2 report (Tasks 1, 2 and 3).
+% Build:  cd report && latexmk -pdf main.tex      (or: make -C report)
+\documentclass[10pt,a4paper]{article}
+\input{preamble}
+
+\begin{document}
+
+\begin{titlepage}
+  \centering
+  \vspace*{55mm}
+  {\large\color{ink2} CS683: Advanced Computer Architecture\par}
+  \vspace{6mm}
+  {\fontsize{24}{29}\selectfont\bfseries Programming Assignment II\par}
+  \vspace{5mm}
+  {\color{accent}\rule{0.55\textwidth}{1.2pt}\par}
+  \vspace{5mm}
+  {\large
+    Task 1: Stride Pattern Prefetcher at L1D\\[1.5mm]
+    Task 2: Instruction-conscious L2 replacement (I-RRIP and Dynamic I-RRIP)\\[1.5mm]
+    Task 3: SPP with prefetch-aware Dynamic I-RRIP\par}
+  \vspace{14mm}
+  {\large
+  \begin{tabular}{l@{\hspace{10mm}}l}
+    Haresh Gupta       & 23b0931 \\
+    Yash Singh         & 23b0934 \\
+    Sai Divya Teja     & 24b1016 \\
+    Shivam Singh Yadav & 23b1007 \\
+  \end{tabular}\par}
+\end{titlepage}
+
+\input{sections/task1}
+\input{sections/setup23}
+\input{sections/task2a}
+\input{sections/task2b}
+\input{sections/task3}
+
+\end{document}

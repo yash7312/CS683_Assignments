@@ -1,5 +1,5 @@
 #!/bin/bash
-# Mirror the repository into a native WSL directory and strip CRLF line endings
+# strip CRLF line endings
 # (the Windows checkout uses CRLF; build_champsim.sh needs LF).
 #   scripts/sync_wsl.sh <src_repo_dir> <dst_dir>
 set -e

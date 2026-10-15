@@ -1,0 +1,166 @@
+% ---------------------------------------------------------------- page and fonts
+\usepackage[a4paper,margin=22mm,headheight=14pt]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[scaled=0.98]{XCharter}          % body text
+\usepackage[xcharter,vvarbb]{newtxmath}      % matching math
+\usepackage[scaled=0.92,varqu]{zi4}          % Inconsolata for code
+\usepackage{microtype}
+\usepackage{amsmath}
+
+% ---------------------------------------------------------------- layout helpers
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{makecell}
+\usepackage[table]{xcolor}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{fancyhdr}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{pifont}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{ink2}{HTML}{52514E}
+\definecolor{accent}{HTML}{2A78D6}
+\definecolor{hl}{HTML}{E8F0FB}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{4.5pt}
+\setlist{itemsep=2pt,topsep=3pt,parsep=0pt,leftmargin=1.4em}
+\linespread{1.04}
+
+\titleformat{\section}{\Large\bfseries}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.7em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{0.7em}{}
+\titlespacing*{\section}{0pt}{14pt}{6pt}
+\titlespacing*{\subsection}{0pt}{11pt}{4pt}
+\titlespacing*{\subsubsection}{0pt}{9pt}{3pt}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\color{ink2}CS683 Programming Assignment II}
+\fancyhead[R]{\small\color{ink2}\nouppercase{\leftmark}}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+\renewcommand{\sectionmark}[1]{\markboth{#1}{}}
+
+\captionsetup{font=small,labelfont=bf,labelsep=period,skip=5pt}
+\captionsetup[sub]{font=small,labelfont=normalfont,skip=2pt}
+\setlength{\abovecaptionskip}{5pt}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\cmark}{\ding{51}}
+\newcommand{\na}{--}
+\newcommand{\grp}[2]{\addlinespace[2pt]\multicolumn{#1}{@{}l}{\textit{#2}}\\}
+\newcommand{\best}{\rowcolor{hl}}
+\newcommand{\chosen}[1]{\best\textbf{#1}}
+
+% ---------------------------------------------------------------- charts
+\usepackage{pgfplots}
+\usepackage{pgfplotstable}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{patterns}
+
+\definecolor{cGray}{HTML}{A3A3A3}
+\definecolor{cBlue}{HTML}{4E79A7}
+\definecolor{cOrange}{HTML}{F28E2B}
+\definecolor{cGreen}{HTML}{59A14F}
+\definecolor{cRed}{HTML}{E15759}
+\definecolor{cTeal}{HTML}{76B7B2}
+\definecolor{cYellow}{HTML}{EDC948}
+\definecolor{cPurple}{HTML}{B07AA1}
+\definecolor{cPink}{HTML}{FF9DA7}
+\definecolor{cBrown}{HTML}{9C755F}
+
+\tikzset{
+  bGray/.style={fill=cGray,draw=cGray!60!black},
+  bBlue/.style={fill=cBlue,draw=cBlue!60!black},
+  bOrange/.style={fill=cOrange,draw=cOrange!60!black},
+  bGreen/.style={fill=cGreen,draw=cGreen!60!black},
+  bRed/.style={fill=cRed,draw=cRed!60!black},
+  bTeal/.style={fill=cTeal,draw=cTeal!60!black},
+  bYellow/.style={fill=cYellow,draw=cYellow!60!black},
+  bPurple/.style={fill=cPurple,draw=cPurple!60!black},
+  bPink/.style={fill=cPink,draw=cPink!60!black},
+  bBrown/.style={fill=cBrown,draw=cBrown!60!black},
+}
+% Task 1 stages: Baseline, IP-stride, V0, V1, P1, P2, P3, AC, Final
+\pgfplotscreateplotcyclelist{stages}{bGray,bBlue,bTeal,bYellow,bBrown,bPink,bGreen,bPurple,bOrange}
+% Task 1 sweeps: variant below, SPP-AC, variant above (and a fourth for Fix4)
+\pgfplotscreateplotcyclelist{sweep}{bTeal,bBlue,bYellow,bBrown}
+\pgfplotscreateplotcyclelist{accov}{bBlue,bOrange}
+% IP-stride vs SPP-Final
+\pgfplotscreateplotcyclelist{final}{bBlue,bOrange}
+% Task 2: LRU, SRRIP, I-RRIP, Dyn-I-RRIP
+\pgfplotscreateplotcyclelist{repl}{bGray,bBlue,bGreen,bOrange}
+% Task 3: Baseline, SPP+LRU, Dyn (no pf), SPP+Dyn, SPP+Dyn-PF
+\pgfplotscreateplotcyclelist{tthree}{bGray,bBlue,bGreen,bYellow,bOrange}
+% Line plots: Trace1, Trace2, Trace3, Geomean
+\pgfplotscreateplotcyclelist{traces}{
+  {cBlue,thick,mark=*,mark size=1.4pt},
+  {cOrange,thick,mark=*,mark size=1.4pt},
+  {cGreen,thick,mark=*,mark size=1.4pt},
+  {black,thick,dashed,mark=square*,mark size=1.3pt}}
+
+\pgfplotsset{
+  base/.style={
+    width=\linewidth, height=46mm, scale only axis=false,
+    font=\footnotesize,
+    axis lines*=left, tick align=outside, major tick length=2pt,
+    ymajorgrids, grid style={gray!22},
+    tick label style={font=\scriptsize},
+    label style={font=\footnotesize},
+    legend style={font=\scriptsize, draw=gray!50, /tikz/every even column/.append style={column sep=4pt}},
+    legend cell align=left,
+    every axis plot/.append style={line width=0.3pt},
+    scaled y ticks=false,
+    yticklabel style={/pgf/number format/.cd, fixed, precision=3},
+  },
+  gbar/.style={base, ybar, xtick=data, enlarge x limits=0.18, xtick style={draw=none}},
+  speedline/.style={extra y ticks={1}, extra y tick style={grid=major, grid style={black!70,dashed,thin}, tick label style={opacity=0}, major tick length=0pt}},
+}
+
+% \gbarplot{table}{y columns}{axis options}: grouped bars, one group per table row (label column "g")
+\newcommand{\gbarplot}[3]{%
+  \pgfplotstablegetrowsof{#1}\pgfmathtruncatemacro\gbn{\pgfplotsretval-1}%
+  \begin{tikzpicture}
+  \begin{axis}[gbar, xtick={0,...,\gbn}, xticklabels from table={#1}{g}, #3]
+    \edef\gbcols{#2}%
+    \expandafter\pgfplotsinvokeforeach\expandafter{\gbcols}{\addplot table[x expr=\coordindex, y=##1]{#1};}
+  \end{axis}
+  \end{tikzpicture}}
+
+% \lineplot{table}{x column}{y columns}{axis options}
+\newcommand{\lineplot}[4]{%
+  \begin{tikzpicture}
+  \begin{axis}[base, cycle list name=traces, #4]
+    \edef\lpcols{#3}%
+    \expandafter\pgfplotsinvokeforeach\expandafter{\lpcols}{\addplot table[x=#2, y=##1]{#1};}
+  \end{axis}
+  \end{tikzpicture}}
+
+% Task 1 sweep figure: (a) speedup per trace, (b) mean accuracy and coverage per variant.
+% #1 speedup table (rows Trace1..3, one column per variant), #2 variant columns,
+% #3 legend entries, #4 acc/cov table (rows = variants), #5 caption
+\newcommand{\sweepfig}[5]{%
+  \begin{figure}[H]
+  \centering
+  \begin{subfigure}{0.49\textwidth}\centering
+    \gbarplot{#1}{#2}{cycle list name=sweep, bar width=7pt, ymin=1, ymax=1.018,
+      ylabel={Speedup}, legend entries={#3}, legend columns=-1,
+      legend style={at={(0.5,1.03)}, anchor=south},
+      yticklabel style={/pgf/number format/.cd, fixed, precision=3}}
+    \caption{Speedup}
+  \end{subfigure}\hfill
+  \begin{subfigure}{0.49\textwidth}\centering
+    \gbarplot{#4}{acc,cov}{cycle list name=accov, bar width=7pt, ymin=0, ymax=80,
+      ylabel={\%}, legend entries={Mean accuracy, Mean coverage}, legend columns=-1,
+      legend style={at={(0.5,1.03)}, anchor=south}, enlarge x limits={abs=0.6}}
+    \caption{Accuracy and coverage}
+  \end{subfigure}
+  \caption{#5}
+  \end{figure}}

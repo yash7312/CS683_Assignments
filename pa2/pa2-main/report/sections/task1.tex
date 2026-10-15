@@ -1,0 +1,732 @@
+% ====================================================================== Task 1
+\section{Task 1: Stride Pattern Prefetcher at L1D}
+
+% ---------------------------------------------------------------- data for the plots
+% Every stage on every trace (Table 1). Columns: base ips v0 v1 p1 p2 p3 ac fin
+\pgfplotstableread{
+g      base   ips    v0     v1     p1     p2     p3     ac     fin
+Trace1 0.2322 0.2334 0.2316 0.2321 0.2325 0.2342 0.2342 0.2344 0.2345
+Trace2 0.2511 0.2512 0.2497 0.2499 0.2525 0.2535 0.2531 0.2537 0.2545
+Trace3 0.3821 0.3830 0.3843 0.3836 0.3877 0.3858 0.3856 0.3869 0.3870
+}\tStageIPC
+\pgfplotstableread{
+g      base   ips    v0     v1     p1     p2     p3     ac     fin
+Trace1 1.0000 1.0051 0.9975 0.9996 1.0012 1.0084 1.0086 1.0094 1.0098
+Trace2 1.0000 1.0002 0.9943 0.9951 1.0055 1.0093 1.0079 1.0102 1.0133
+Trace3 1.0000 1.0024 1.0059 1.0042 1.0147 1.0097 1.0094 1.0128 1.0128
+}\tStageSpd
+\pgfplotstableread{
+g      base   ips    v0     v1     p1     p2     p3     ac     fin
+Trace1 10.68  10.12  9.70   9.82   9.50   9.83   9.89   9.70   9.68
+Trace2 13.53  13.44  13.45  13.48  13.11  13.16  13.19  13.07  12.94
+Trace3 3.40   3.32   3.07   3.21   2.91   3.10   3.12   3.02   3.04
+}\tStageMpki
+\pgfplotstableread{
+g      base   ips    v0     v1     p1     p2     p3     ac     fin
+Trace1 nan    52.8   32.4   35.4   38.2   56.0   61.4   56.5   57.8
+Trace2 nan    38.1   18.7   18.7   26.6   54.7   63.0   59.3   63.3
+Trace3 nan    16.1   18.6   20.5   31.3   37.3   40.5   41.9   41.0
+}\tStageAcc
+\pgfplotstableread{
+g      base   ips    v0     v1     p1     p2     p3     ac     fin
+Trace1 0.00   5.24   9.15   8.03   11.06  7.96   7.37   9.17   9.37
+Trace2 0.00   0.73   0.59   0.43   3.11   2.77   2.53   3.45   4.40
+Trace3 0.00   2.51   9.83   5.64   14.48  8.96   8.25   11.13  10.69
+}\tStageCov
+\newcommand{\stagecols}{base,ips,v0,v1,p1,p2,p3,ac,fin}
+\newcommand{\stageopts}{cycle list name=stages, bar width=2.5pt, enlarge x limits=0.2}
+
+\subsection{Task 1A: IP-Stride Prefetcher (\code{IP-stride})}
+ChampSim calls the L1D prefetcher on every demand load, with the virtual address and the instruction
+pointer (IP) of the load. The provided \code{ip\_stride} prefetcher works like this:
+\begin{itemize}
+  \item \textbf{Tracker table:} 24 entries, fully associative, replaced by LRU. Each entry stores an IP tag
+        (\code{ip \& 0xFF}), the last cache-line address of that IP, the last stride (in cache lines) and the LRU rank.
+  \item \textbf{New IP:} the LRU entry is replaced and no prefetch is issued.
+  \item \textbf{Known IP:} the new stride is (current line $-$ last line). A stride of 0 is ignored.
+  \item \textbf{Trigger:} a prefetch is issued only when the new stride equals the stored stride (the same stride twice in a row).
+  \item \textbf{Prefetch:} lines $\mathrm{cl}+s$, $\mathrm{cl}+2s$, $\mathrm{cl}+3s$ (degree 3). The loop stops when a line
+        leaves the 4\,KB page of the demand access.
+  \item \textbf{Target level:} the L1D if less than half of the MSHRs are used, otherwise the L2.
+  \item \textbf{Feedback:} none. The \code{cache\_fill} hook is empty and the degree is fixed.
+\end{itemize}
+It captures only constant strides such as $A$, $A{+}2$, $A{+}4$. A repeating pattern such as
+$+1, +2, +2, +2, +3$ never has two equal strides in a row, so it never triggers a prefetch.
+
+\subsection{Task 1B: Stride Pattern Prefetcher (SPP)}
+SPP runs at the L1D, tracks every IP separately, never crosses a 4\,KB page, supports a degree larger than 1,
+and checks \emph{uniform} strides first and \emph{non-uniform} stride patterns second. The sections below add one
+feature at a time. The names \code{SPP-V0}, \code{SPP-V1}, \code{SPP-P1}, \code{SPP-P2}, \code{SPP-P3}, \code{SPP-AC}
+and \code{SPP-Final} are the names used in the tables and plots.
+
+\subsubsection{\code{SPP-V0}: Basic Non-Uniform Prefetcher}
+\begin{itemize}
+  \item \textbf{Tracker table:} same as \code{IP-stride} (24 entries, 8-bit IP tag, LRU), with two extra fields per
+        entry: a 12-bit \emph{signature} and a \emph{uniform counter}.
+  \item \textbf{Signature:} the last three strides of the IP, 4 bits each:
+        \[ \mathrm{sig}' = \bigl((\mathrm{sig} \ll 4) \mid (s \mathbin{\&} \code{0xF})\bigr) \mathbin{\&} \code{0xFFF} \]
+  \item \textbf{Pattern History Table (PHT):} 4096 entries, indexed by the signature, each storing one stride.
+        When a new stride $s$ is seen, the entry of the \emph{old} signature is set to $s$
+        (``after this history, this stride came next'').
+  \item \textbf{Uniform first:} if the new stride equals the previous stride, the IP is uniform and SPP prefetches
+        exactly like \code{IP-stride}.
+  \item \textbf{Non-uniform fallback:} otherwise the signature reads the PHT to get the next stride. The signature
+        is then advanced with that predicted stride to predict the stride after it (chaining), until the degree
+        is reached or the PHT entry is empty.
+  \item \textbf{Degree:} fixed at 3. Prefetches stay in the demand page. Target level (L1D or L2) is chosen by MSHR
+        occupancy, as in \code{IP-stride}.
+\end{itemize}
+\emph{Example:} for the repeating strides $(+1, +2, +2, +2, +3)$ the five 3-stride signatures are all different,
+$(1,2,2)\to2$, $(2,2,2)\to3$, $(2,2,3)\to1$, $(2,3,1)\to2$, $(3,1,2)\to2$, so after one pass the PHT predicts the
+whole pattern.
+
+\subsubsection{\code{SPP-V1}: Fill-Based Throttling}
+\code{SPP-V0} plus a first throttling step:
+\begin{itemize}
+  \item Every 1000 demand accesses, compute (prefetched lines filled into L1D) / (prefetches issued).
+  \item Degree 3 if this ratio is $\ge 50\%$, degree 2 if $\ge 25\%$, otherwise degree 1.
+  \item This ratio counts prefetches that arrived in the cache, not prefetches that were used later.
+\end{itemize}
+
+\subsubsection{\code{SPP-P1}: Larger Tracker Table}
+\code{SPP-V1} plus:
+\begin{itemize}
+  \item Tracker table from 24 to 128 entries, IP tag from 8 to 12 bits.
+  \item A valid bit per entry, so an empty entry cannot match an IP whose tag is 0.
+  \item \textbf{Why:} fewer different IPs share one tracker, and trackers live long enough to collect a full stride history.
+\end{itemize}
+
+\subsubsection{\code{SPP-P2}: Clean Stride History}
+\code{SPP-P1} plus:
+\begin{itemize}
+  \item \textbf{Stride range:} a stride outside $[-64, +63]$ lines restarts the history of that IP and is not stored.
+        A page has only 64 lines, so such a stride can never give a same-page prefetch.
+  \item \textbf{History count:} a 2-bit counter (0 to 3) per tracker. The PHT is trained and read only after 3 valid
+        strides, so signatures padded with zeros do not pollute it.
+\end{itemize}
+
+\subsubsection{\code{SPP-P3}: PHT Confidence}
+\code{SPP-P2} plus a 2-bit saturating confidence in every PHT entry (0 means empty):
+\begin{itemize}
+  \item \textbf{Entry empty:} store the stride, confidence $=1$.
+  \item \textbf{Same stride seen again:} confidence $+1$ (maximum 3).
+  \item \textbf{Different stride seen:} confidence $-1$. At 0 the entry takes the new stride with confidence 1.
+  \item \textbf{Prediction:} the first predicted stride needs confidence $\ge 2$. Every further (chained) stride needs
+        confidence $=3$, because a chained prediction depends on the one before it.
+\end{itemize}
+
+\subsubsection{\code{SPP-AC}: Accuracy Checker}
+\code{SPP-AC} is \code{SPP-P3} with the fill-based throttling of \code{SPP-V1} replaced by a checker that measures real usefulness.
+\begin{itemize}
+  \item \textbf{Prefetch filter:} 64 entries, direct-mapped by the low 6 bits of the cache-line address, each with a
+        valid bit and a 10-bit partial tag. It remembers lines our prefetcher filled into the L1D that no demand
+        load has used yet.
+  \item \textbf{Fill hook:} when a prefetched line is filled (\code{l1d\_prefetcher\_cache\_fill}, \code{prefetch=1}),
+        insert its virtual line address into the filter and add 1 to the fill counter $F$.
+  \item \textbf{Use hook:} a demand load that hits in the L1D (\code{l1d\_prefetcher\_operate}) and finds its line in
+        the filter adds 1 to the useful counter $U$ and clears the entry, so each line counts once.
+  \item \textbf{Epoch:} after $W = 256$ fills, the accuracy is $A = \lfloor 100\,U/F \rfloor$ and the degree for the next epoch is
+        \[ d = \begin{cases}
+            D_H & A \ge T_H\\
+            D_M & T_M \le A < T_H\\
+            D_L & T_L \le A < T_M\\
+            D_{\min} & A < T_L
+          \end{cases} \]
+        Then $F$ and $U$ are reset to 0. The degree starts at 3.
+  \item $\boldsymbol{D_{\min} = 1}$\textbf{, never 0:} epochs are counted in fills, so with degree 0 no fill would happen,
+        the epoch would never end and the degree could never go up again.
+\end{itemize}
+\code{SPP-AC} uses 128 trackers with a 12-bit IP tag, a 64-entry filter, $W = 256$, thresholds
+$(T_H, T_M, T_L) = (75, 50, 25)$ and degrees $(D_H, D_M, D_L, D_{\min}) = (6, 4, 2, 1)$. Section~\ref{sec:t1-values}
+examines each of these values.
+
+\subsubsection{\code{SPP-Final}: The Submitted Prefetcher}
+\code{SPP-Final} is \code{SPP-AC} with an \textbf{8-bit IP tag} and a \textbf{32-entry prefetch filter}. All other values
+are the same as in \code{SPP-AC}. It is the file \code{prefetcher/spp.l1d\_pref}. Section~\ref{sec:t1-final} explains why.
+
+\subsubsection{Sweep Variants}
+Each variant changes one value of \code{SPP-AC}.
+\begin{table}[H]
+\centering\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Names & What changes \\
+\midrule
+\code{Trk64}, \code{Trk256}         & tracker entries 64 or 256 (default 128) \\
+\code{Tag8}                         & 8-bit IP tag (default 12) \\
+\code{Flt32}, \code{Flt128}         & prefetch filter 32 or 128 entries (default 64) \\
+\code{Win128}, \code{Win512}        & epoch of 128 or 512 fills (default 256) \\
+\code{ThrStrict}, \code{ThrLoose}   & thresholds 90/70/50 or 60/40/20 (default 75/50/25) \\
+\code{DegHi4}, \code{DegHi8}        & high-band degree 4 or 8 (default 6) \\
+\code{DegMid3}, \code{DegMid5}      & middle-band degree 3 or 5 (default 4) \\
+\code{DegLow1}, \code{DegLow3}      & low-band degree 1 or 3 (default 2) \\
+\code{Fix1} to \code{Fix4}          & throttling off, always degree 1 to 4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Metrics}
+$I$ is the number of simulated instructions, $C$ the number of cycles and $M$ the number of L1D load misses.
+Subscript $b$ is the baseline (no prefetching), $p$ is a run with a prefetcher.
+\[
+\mathrm{IPC} = I/C,\qquad \mathrm{Speedup} = \mathrm{IPC}_p/\mathrm{IPC}_b,\qquad \mathrm{MPKI} = 1000\,M/I,
+\]
+\[
+\mathrm{Coverage} = (M_b - M_p)/M_b \times 100\%,\qquad
+\mathrm{Accuracy} = \frac{\text{useful prefetches}}{\text{prefetches issued to the next level}} \times 100\%.
+\]
+MPKI and accuracy are read from the ChampSim statistics of the L1D. The accuracy checker inside \code{SPP-AC} and
+\code{SPP-Final} uses its own cheaper estimate only for throttling, never in the tables. When we compare
+configurations over all traces we use the geometric mean of the three speedups, and the arithmetic mean of
+accuracy and coverage. All runs: single core, hashed perceptron branch predictor, LRU at all levels, no other
+prefetcher, 25M warm-up and 25M simulated instructions, traces Trace1 to Trace3.
+
+\subsection{Impact of Each Feature}
+Table~\ref{tab:t1-stages} shows every stage on every trace, Table~\ref{tab:t1-avg} the averages, and
+Figures~\ref{fig:t1-stages} and~\ref{fig:t1-cov} the same data as plots. Each stage adds one feature to the stage
+before it, in the order of Section~1.2.
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Prefetcher & IPC & Speedup & L1D load MPKI & Accuracy (\%) & Coverage (\%) \\
+\midrule
+\grp{6}{Trace1}
+Baseline           & 0.2322 & 1.0000 & 10.68 & \na  & 0.00 \\
+\code{IP-stride}   & 0.2334 & 1.0051 & 10.12 & 52.8 & 5.24 \\
+\code{SPP-V0}      & 0.2316 & 0.9975 & 9.70  & 32.4 & 9.15 \\
+\code{SPP-V1}      & 0.2321 & 0.9996 & 9.82  & 35.4 & 8.03 \\
+\code{SPP-P1}      & 0.2325 & 1.0012 & 9.50  & 38.2 & 11.06 \\
+\code{SPP-P2}      & 0.2342 & 1.0084 & 9.83  & 56.0 & 7.96 \\
+\code{SPP-P3}      & 0.2342 & 1.0086 & 9.89  & 61.4 & 7.37 \\
+\code{SPP-AC}      & 0.2344 & 1.0094 & 9.70  & 56.5 & 9.17 \\
+\code{SPP-Final}   & 0.2345 & 1.0098 & 9.68  & 57.8 & 9.37 \\
+\midrule
+\grp{6}{Trace2}
+Baseline           & 0.2511 & 1.0000 & 13.53 & \na  & 0.00 \\
+\code{IP-stride}   & 0.2512 & 1.0002 & 13.44 & 38.1 & 0.73 \\
+\code{SPP-V0}      & 0.2497 & 0.9943 & 13.45 & 18.7 & 0.59 \\
+\code{SPP-V1}      & 0.2499 & 0.9951 & 13.48 & 18.7 & 0.43 \\
+\code{SPP-P1}      & 0.2525 & 1.0055 & 13.11 & 26.6 & 3.11 \\
+\code{SPP-P2}      & 0.2535 & 1.0093 & 13.16 & 54.7 & 2.77 \\
+\code{SPP-P3}      & 0.2531 & 1.0079 & 13.19 & 63.0 & 2.53 \\
+\code{SPP-AC}      & 0.2537 & 1.0102 & 13.07 & 59.3 & 3.45 \\
+\code{SPP-Final}   & 0.2545 & 1.0133 & 12.94 & 63.3 & 4.40 \\
+\midrule
+\grp{6}{Trace3}
+Baseline           & 0.3821 & 1.0000 & 3.40 & \na  & 0.00 \\
+\code{IP-stride}   & 0.3830 & 1.0024 & 3.32 & 16.1 & 2.51 \\
+\code{SPP-V0}      & 0.3843 & 1.0059 & 3.07 & 18.6 & 9.83 \\
+\code{SPP-V1}      & 0.3836 & 1.0042 & 3.21 & 20.5 & 5.64 \\
+\code{SPP-P1}      & 0.3877 & 1.0147 & 2.91 & 31.3 & 14.48 \\
+\code{SPP-P2}      & 0.3858 & 1.0097 & 3.10 & 37.3 & 8.96 \\
+\code{SPP-P3}      & 0.3856 & 1.0094 & 3.12 & 40.5 & 8.25 \\
+\code{SPP-AC}      & 0.3869 & 1.0128 & 3.02 & 41.9 & 11.13 \\
+\code{SPP-Final}   & 0.3870 & 1.0128 & 3.04 & 41.0 & 10.69 \\
+\bottomrule
+\end{tabular}
+\caption{Every stage of the design on every trace (25M warm-up, 25M simulated instructions).}
+\label{tab:t1-stages}
+\end{table}
+
+\begin{table}[H]
+\centering\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Prefetcher & Geometric-mean speedup & Mean accuracy (\%) & Mean coverage (\%) \\
+\midrule
+Baseline         & 1.00000 & \na   & 0.00 \\
+\code{IP-stride} & 1.00257 & 35.67 & 2.83 \\
+\code{SPP-V0}    & 0.99923 & 23.21 & 6.52 \\
+\code{SPP-V1}    & 0.99963 & 24.88 & 4.70 \\
+\code{SPP-P1}    & 1.00710 & 32.04 & 9.55 \\
+\code{SPP-P2}    & 1.00914 & 49.30 & 6.56 \\
+\code{SPP-P3}    & 1.00863 & 55.00 & 6.05 \\
+\code{SPP-AC}    & 1.01079 & 52.58 & 7.92 \\
+\code{SPP-Final} & 1.01200 & 54.03 & 8.15 \\
+\bottomrule
+\end{tabular}
+\caption{Average over the three traces (geometric mean for speedup, arithmetic mean for accuracy and coverage).}
+\label{tab:t1-avg}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tStageIPC}{\stagecols}{\stageopts, ymin=0, ymax=0.45, ylabel={IPC},
+    legend entries={Baseline,IP-stride,V0,V1,P1,P2,P3,AC,Final}, legend columns=5,
+    legend to name=leg:stages}
+  \caption{IPC}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tStageSpd}{\stagecols}{\stageopts, ymin=0.99, ymax=1.02, ylabel={Speedup}, speedline}
+  \caption{Speedup}
+\end{subfigure}\\[4pt]
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tStageMpki}{\stagecols}{\stageopts, ymin=0, ymax=15, ylabel={L1D load MPKI}}
+  \caption{L1D load MPKI}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tStageAcc}{\stagecols}{\stageopts, ymin=0, ymax=70, ylabel={Accuracy (\%)}}
+  \caption{Prefetch accuracy}
+\end{subfigure}\\[3pt]
+\ref*{leg:stages}
+\caption{Every stage of the design. Bars in each trace group, left to right: Baseline, \code{IP-stride},
+\code{SPP-V0}, \code{SPP-V1}, \code{SPP-P1}, \code{SPP-P2}, \code{SPP-P3}, \code{SPP-AC}, \code{SPP-Final}.}
+\label{fig:t1-stages}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tStageCov}{\stagecols}{\stageopts, ymin=0, ymax=16, ylabel={Coverage (\%)}}
+  \caption{Prefetch coverage}
+\end{subfigure}\\[3pt]
+\ref*{leg:stages}
+\caption{Coverage of every stage (same bar order as Figure~\ref{fig:t1-stages}). The baseline issues no prefetches,
+so it has no accuracy or coverage bars.}
+\label{fig:t1-cov}
+\end{figure}
+
+\subsection{How Each Value Was Chosen}\label{sec:t1-values}
+
+\subsubsection{Method}
+\begin{itemize}
+  \item \textbf{Starting point:} \code{SPP-AC}. Each sweep variant changes \textbf{one} value and keeps all others,
+        with the same traces and instruction counts.
+  \item \textbf{Main measure:} geometric-mean speedup over the three traces. Accuracy and coverage are used to explain the result.
+  \item A gap below 0.05\% is called a \textbf{tie}. We only have three traces and cannot tell such a small gap from
+        trace-sample noise. The 0.05\% cutoff is our own choice.
+  \item In a tie we keep the current value. The exception is table size: equal speed with less storage wins.
+  \item Each value was changed alone. The two changes that make \code{SPP-Final} were then run together (Section~\ref{sec:t1-final}).
+  \item Every subsection below gives the table and the plots of one value, then the decision with its reason.
+        The plots use the same axis range, so they can be compared.
+\end{itemize}
+
+% sweep tables: \swrow{name}{value}{T1}{T2}{T3}{geomean}{acc}{cov}
+\newcommand{\swhead}{\toprule Variant & Value & Speedup T1 & Speedup T2 & Speedup T3 & Geomean speedup & Mean acc (\%) & Mean cov (\%) \\ \midrule}
+\newcommand{\swtab}[2]{%
+  \begin{table}[H]\centering\small
+  \begin{tabular}{@{}llcccccc@{}}\swhead #1 \bottomrule\end{tabular}
+  \caption{#2 Only this value changes; bold row = \code{SPP-AC}.}
+  \end{table}}
+\newcommand{\acrow}{\best\textbf{\code{SPP-AC}}}
+\newcommand{\acvals}{1.0094 & 1.0102 & 1.0128 & 1.01079 & 52.58 & 7.92}
+
+\subsubsection{IP Tracker Table Entries}
+\code{Trk64}, \code{SPP-AC} (128) and \code{Trk256}.
+\swtab{
+  \code{Trk64}  & 64  & 1.0083 & 1.0026 & 1.0082 & 1.00636 & 47.51 & 6.16 \\
+  \acrow        & 128 & \acvals \\
+  \code{Trk256} & 256 & 1.0107 & 1.0124 & 1.0162 & 1.01313 & 53.89 & 8.98 \\
+}{IP tracker table entries.}
+\pgfplotstableread{
+g      a      b      c
+Trace1 1.0083 1.0094 1.0107
+Trace2 1.0026 1.0102 1.0124
+Trace3 1.0082 1.0128 1.0162
+}\tSw
+\pgfplotstableread{
+g      acc   cov
+Trk64  47.51 6.16
+SPP-AC 52.58 7.92
+Trk256 53.89 8.98
+}\tAc
+\sweepfig{\tSw}{a,b,c}{Trk64,SPP-AC,Trk256}{\tAc}{IP tracker table entries: speedup per trace (left) and mean accuracy and coverage (right).}
+\begin{itemize}
+  \item 64 entries is clearly worse ($-0.439\%$).
+  \item 256 entries is better ($+0.232\%$) and better on all three traces.
+  \item \textbf{Cost:} 64 more entries (64 to 128) need $64 \times 84 = 5376$ bits, about 0.66\,KiB, and gave about 0.67\%
+        speedup per KiB. 128 more entries (128 to 256) need $128 \times 84 = 10752$ bits, about 1.3\,KiB (22\% of the
+        whole prefetcher), and give about 0.18\% speedup per KiB. The second doubling gives under a third of the
+        speedup per KiB of the first.
+  \item \textbf{Decision: keep 128 entries.} The assignment asks for a lightweight prefetcher with maximum performance
+        for minimal storage. The gain of the second doubling is real but small for its cost, so we accept the lower
+        speed to stay small. If storage were not a concern, 256 would be the better choice.
+\end{itemize}
+
+\subsubsection{IP Tag Bits}
+\code{Tag8} and \code{SPP-AC} (12 bits), with 128 entries.
+\swtab{
+  \code{Tag8} & 8  & 1.0098 & 1.0135 & 1.0130 & 1.01206 & 53.86 & 8.28 \\
+  \acrow      & 12 & \acvals \\
+}{IP tag bits.}
+\pgfplotstableread{
+g      a      b
+Trace1 1.0098 1.0094
+Trace2 1.0135 1.0102
+Trace3 1.0130 1.0128
+}\tSw
+\pgfplotstableread{
+g      acc   cov
+Tag8   53.86 8.28
+SPP-AC 52.58 7.92
+}\tAc
+\sweepfig{\tSw}{a,b}{Tag8,SPP-AC}{\tAc}{IP tag bits: speedup per trace (left) and mean accuracy and coverage (right).}
+\begin{itemize}
+  \item The 8-bit tag is faster ($+0.126\%$, a real gain) and also needs 4 bits less per tracker entry.
+  \item \textbf{Decision: 8 bits.} Better and smaller.
+  \item We tested only 8 and 12 bits, so 8 is not shown to be the best width. We did not investigate why the shorter tag helps.
+\end{itemize}
+
+\subsubsection{Prefetch Filter Entries}
+\code{Flt32}, \code{SPP-AC} (64) and \code{Flt128}.
+\swtab{
+  \code{Flt32}  & 32  & 1.0094 & 1.0101 & 1.0128 & 1.01075 & 52.78 & 7.85 \\
+  \acrow        & 64  & \acvals \\
+  \code{Flt128} & 128 & 1.0094 & 1.0102 & 1.0131 & 1.01092 & 52.55 & 8.02 \\
+}{Prefetch filter entries.}
+\pgfplotstableread{
+g      a      b      c
+Trace1 1.0094 1.0094 1.0094
+Trace2 1.0101 1.0102 1.0102
+Trace3 1.0128 1.0128 1.0131
+}\tSw
+\pgfplotstableread{
+g      acc   cov
+Flt32  52.78 7.85
+SPP-AC 52.58 7.92
+Flt128 52.55 8.02
+}\tAc
+\sweepfig{\tSw}{a,b,c}{Flt32,SPP-AC,Flt128}{\tAc}{Prefetch filter entries: speedup per trace (left) and mean accuracy and coverage (right).}
+\begin{itemize}
+  \item 32, 64 and 128 entries are ties ($-0.004\%$ and $+0.013\%$). Accuracy and coverage barely change.
+  \item \textbf{Decision: 32 entries.} Equal speed with less storage wins.
+  \item We did not test fewer than 32 entries.
+\end{itemize}
+
+\subsubsection{Epoch Length}
+\code{Win128}, \code{SPP-AC} (256) and \code{Win512}.
+\swtab{
+  \code{Win128} & 128 & 1.0095 & 1.0103 & 1.0134 & 1.01106 & 52.81 & 8.04 \\
+  \acrow        & 256 & \acvals \\
+  \code{Win512} & 512 & 1.0092 & 1.0102 & 1.0124 & 1.01058 & 51.40 & 7.60 \\
+}{Epoch length (prefetch fills).}
+\pgfplotstableread{
+g      a      b      c
+Trace1 1.0095 1.0094 1.0092
+Trace2 1.0103 1.0102 1.0102
+Trace3 1.0134 1.0128 1.0124
+}\tSw
+\pgfplotstableread{
+g      acc   cov
+Win128 52.81 8.04
+SPP-AC 52.58 7.92
+Win512 51.40 7.60
+}\tAc
+\sweepfig{\tSw}{a,b,c}{Win128,SPP-AC,Win512}{\tAc}{Epoch length (prefetch fills): speedup per trace (left) and mean accuracy and coverage (right).}
+\begin{itemize}
+  \item 128, 256 and 512 fills are ties ($+0.027\%$ and $-0.020\%$).
+  \item \textbf{Decision: keep 256.} With 256 samples the measured accuracy has a standard error of at most
+        $\sqrt{0.25/256} \approx 3.1$ points, much smaller than the 25-point band width, so a band is rarely chosen
+        by noise. A shorter epoch would react faster but change the degree more often, a longer one would react
+        slowly to program phases. The sweep shows no reason to change it.
+\end{itemize}
+
+\subsubsection{Accuracy Thresholds}
+\code{ThrStrict} (90/70/50), \code{SPP-AC} (75/50/25) and \code{ThrLoose} (60/40/20), with the degrees 6/4/2/1.
+\swtab{
+  \code{ThrStrict} & 90/70/50 & 1.0092 & 1.0101 & 1.0116 & 1.01026 & 56.24 & 7.13 \\
+  \acrow           & 75/50/25 & \acvals \\
+  \code{ThrLoose}  & 60/40/20 & 1.0090 & 1.0102 & 1.0132 & 1.01080 & 50.53 & 8.15 \\
+}{Accuracy thresholds.}
+\pgfplotstableread{
+g      a      b      c
+Trace1 1.0092 1.0094 1.0090
+Trace2 1.0101 1.0102 1.0102
+Trace3 1.0116 1.0128 1.0132
+}\tSw
+\pgfplotstableread{
+g         acc   cov
+ThrStrict 56.24 7.13
+SPP-AC    52.58 7.92
+ThrLoose  50.53 8.15
+}\tAc
+\sweepfig{\tSw}{a,b,c}{ThrStrict,SPP-AC,ThrLoose}{\tAc}{Accuracy thresholds: speedup per trace (left) and mean accuracy and coverage (right).}
+\begin{itemize}
+  \item Starting point: four degrees need four accuracy bands, so we split 0 to 100\% into four equal bands, 75/50/25.
+  \item \code{ThrStrict} is $-0.053\%$ against 75/50/25. Its accuracy is higher (56.2\% against 52.6\%) but its coverage
+        is lower (7.13\% against 7.92\%): it keeps the degree low too often.
+  \item \code{ThrLoose} is a tie in speedup ($+0.001\%$) and has lower accuracy (50.5\%).
+  \item \textbf{Decision: keep 75/50/25.} Strict is slower, and loose is not faster and is less accurate.
+\end{itemize}
+
+\subsubsection{Prefetch Degrees: Why Different Degrees for Different Accuracy}
+The degree is how far ahead we prefetch. Going further hides more latency when the prefetches are used, but every
+extra prefetch that is not used wastes bandwidth and takes a place in the L1D. So accurate streams get a high
+degree and inaccurate streams a low degree. The next four tables test this: fixed degrees first, then each band alone.
+
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}llcccccc@{}}\swhead
+  \code{Fix1} & 1 & 1.0081 & 1.0078 & 1.0075 & 1.00780 & 55.12 & 5.28 \\
+  \code{Fix2} & 2 & 1.0091 & 1.0086 & 1.0102 & 1.00930 & 51.86 & 6.65 \\
+  \code{Fix3} & 3 & 1.0091 & 1.0088 & 1.0115 & 1.00981 & 47.75 & 7.39 \\
+  \code{Fix4} & 4 & 1.0091 & 1.0091 & 1.0125 & 1.01024 & 44.77 & 7.99 \\
+\bottomrule\end{tabular}
+\caption{Fixed degree, throttling off. Only this value changes; bold row = \code{SPP-AC}.}
+\end{table}
+\pgfplotstableread{
+g      a      b      c      d
+Trace1 1.0081 1.0091 1.0091 1.0091
+Trace2 1.0078 1.0086 1.0088 1.0091
+Trace3 1.0075 1.0102 1.0115 1.0125
+}\tSw
+\pgfplotstableread{
+g    acc   cov
+Fix1 55.12 5.28
+Fix2 51.86 6.65
+Fix3 47.75 7.39
+Fix4 44.77 7.99
+}\tAc
+\sweepfig{\tSw}{a,b,c,d}{Fix1,Fix2,Fix3,Fix4}{\tAc}{Fixed degree, throttling off: speedup per trace (left) and mean accuracy and coverage (right).}
+
+\textbf{Fixed degrees (throttling off)}
+\begin{itemize}
+  \item Speedup grows with the degree, but accuracy falls (55.1\%, 51.9\%, 47.8\%, 44.8\%). A deeper degree gives
+        speed but costs accuracy.
+  \item \code{SPP-AC} (throttled, 6/4/2/1) is $+0.054\%$ against the best fixed degree (\code{Fix4}), with accuracy
+        52.6\% against 44.8\%. The checker gives high degrees only when prefetches are being used.
+\end{itemize}
+
+\textbf{High band (accuracy at least 75\%)}\\
+\code{DegHi4}, \code{SPP-AC} (6) and \code{DegHi8}.
+\swtab{
+  \code{DegHi4} & 4 & 1.0090 & 1.0094 & 1.0116 & 1.01004 & 51.56 & 7.55 \\
+  \acrow        & 6 & \acvals \\
+  \code{DegHi8} & 8 & 1.0092 & 1.0109 & 1.0136 & 1.01125 & 53.33 & 8.18 \\
+}{Degree of the high band.}
+\pgfplotstableread{
+g      a      b      c
+Trace1 1.0090 1.0094 1.0092
+Trace2 1.0094 1.0102 1.0109
+Trace3 1.0116 1.0128 1.0136
+}\tSw
+\pgfplotstableread{
+g      acc   cov
+DegHi4 51.56 7.55
+SPP-AC 52.58 7.92
+DegHi8 53.33 8.18
+}\tAc
+\sweepfig{\tSw}{a,b,c}{DegHi4,SPP-AC,DegHi8}{\tAc}{Degree of the high band: speedup per trace (left) and mean accuracy and coverage (right).}
+\begin{itemize}
+  \item Degree 4 is worse ($-0.074\%$). Degree 8 is a tie ($+0.045\%$), better on Trace2 and Trace3 but lower on Trace1.
+  \item \textbf{Decision: keep 6.} When at least 75\% of prefetches are used, a deeper degree pays off, as the
+        fixed-degree test shows. 8 is not clearly better than 6, so we keep the smaller degree.
+\end{itemize}
+
+\textbf{Middle band (accuracy 50 to 75\%)}\\
+\code{DegMid3}, \code{SPP-AC} (4) and \code{DegMid5}.
+\swtab{
+  \code{DegMid3} & 3 & 1.0094 & 1.0102 & 1.0125 & 1.01067 & 53.30 & 7.78 \\
+  \acrow         & 4 & \acvals \\
+  \code{DegMid5} & 5 & 1.0090 & 1.0103 & 1.0133 & 1.01085 & 52.29 & 8.04 \\
+}{Degree of the middle band.}
+\pgfplotstableread{
+g      a      b      c
+Trace1 1.0094 1.0094 1.0090
+Trace2 1.0102 1.0102 1.0103
+Trace3 1.0125 1.0128 1.0133
+}\tSw
+\pgfplotstableread{
+g       acc   cov
+DegMid3 53.30 7.78
+SPP-AC  52.58 7.92
+DegMid5 52.29 8.04
+}\tAc
+\sweepfig{\tSw}{a,b,c}{DegMid3,SPP-AC,DegMid5}{\tAc}{Degree of the middle band: speedup per trace (left) and mean accuracy and coverage (right).}
+\begin{itemize}
+  \item Degree 3 ($-0.011\%$) and degree 5 ($+0.006\%$) are ties.
+  \item \textbf{Decision: keep 4}, between the high-band degree 6 and the low-band degree 2. The data does not show
+        that 4 is better than 3 or 5. It is kept as chosen.
+\end{itemize}
+
+\textbf{Low band (accuracy 25 to 50\%)}\\
+\code{DegLow1}, \code{SPP-AC} (2) and \code{DegLow3}.
+\swtab{
+  \code{DegLow1} & 1 & 1.0090 & 1.0100 & 1.0122 & 1.01042 & 54.31 & 7.43 \\
+  \acrow         & 2 & \acvals \\
+  \code{DegLow3} & 3 & 1.0093 & 1.0101 & 1.0132 & 1.01086 & 50.29 & 8.03 \\
+}{Degree of the low band.}
+\pgfplotstableread{
+g      a      b      c
+Trace1 1.0090 1.0094 1.0093
+Trace2 1.0100 1.0102 1.0101
+Trace3 1.0122 1.0128 1.0132
+}\tSw
+\pgfplotstableread{
+g       acc   cov
+DegLow1 54.31 7.43
+SPP-AC  52.58 7.92
+DegLow3 50.29 8.03
+}\tAc
+\sweepfig{\tSw}{a,b,c}{DegLow1,SPP-AC,DegLow3}{\tAc}{Degree of the low band: speedup per trace (left) and mean accuracy and coverage (right).}
+\begin{itemize}
+  \item Degree 1 ($-0.037\%$) and degree 3 ($+0.007\%$) are ties. Degree 1 has higher accuracy (54.3\%) and lower
+        coverage (7.43\%), degree 3 the opposite.
+  \item \textbf{Decision: keep 2.} Less than half of the prefetches are used here, so we prefetch less than in the
+        middle band. The data does not show that 2 is better than 1 or 3.
+\end{itemize}
+
+\textbf{Bottom band (accuracy below 25\%)}\\
+The degree is \textbf{1, never 0}. Without any prefetch no fill happens, the epoch never ends and the degree can never
+recover. All four degrees are used on every trace (Table~\ref{tab:t1-epochs}), so every band is active.
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Trace & Degree 1 & Degree 2 & Degree 4 & Degree 6 & Total epochs \\
+\midrule
+Trace1 & 1  & 108 & 249 & 90  & 448 \\
+Trace2 & 9  & 53  & 73  & 165 & 300 \\
+Trace3 & 33 & 77  & 77  & 83  & 270 \\
+\bottomrule
+\end{tabular}
+\caption{\code{SPP-Final}: number of 256-fill epochs that ended with each prefetch degree.}
+\label{tab:t1-epochs}
+\end{table}
+
+\subsubsection{Values Fixed by Design (not swept)}
+\begin{itemize}
+  \item \textbf{Stride range $-64$ to $+63$:} a page has 64 lines, so larger strides cannot give a same-page prefetch.
+  \item \textbf{History needed $=3$ strides:} equal to the signature length, so the PHT is used only with a full signature.
+  \item \textbf{Minimum degree 1:} explained above.
+  \item \textbf{Signature $=3$ strides of 4 bits, PHT of 4096 entries:} inherited from our first version. Three
+        strides are enough for the assignment's example pattern. We did not test other lengths. A 4-bit stride mixes
+        strides that differ by a multiple of 16.
+  \item \textbf{PHT confidence (2 bits, 2 to start, 3 for chained strides):} chosen by reasoning (a chained prediction
+        depends on the one before it), not by a sweep.
+  \item \textbf{Start degree 3:} used only until the first epoch ends. Not tested.
+  \item \textbf{Same-page rule, MSHR rule for the target level, uniform trigger:} taken from \code{IP-stride}.
+  \item \textbf{Features added in groups:} \code{SPP-P1} changed three things at once (128 entries, 12-bit tag, valid bit)
+        and \code{SPP-P2} two (stride range, history count). They were not tested one at a time. Their reasons are
+        in Section~1.2, and the entries and tag were then swept above.
+\end{itemize}
+
+\subsubsection{Summary of Decisions}
+\begin{table}[H]\centering\small
+\begin{tabularx}{\textwidth}{@{}lllX@{}}
+\toprule
+Value & Chosen & Decided by & Reason \\
+\midrule
+Tracker entries              & 128                       & sweep + storage    & 256 is faster but about 22\% more storage for a small gain \\
+IP tag                       & 8 bits                    & sweep              & faster and smaller than 12 bits \\
+Prefetch filter              & 32 entries                & sweep + storage    & tie in speed, smaller \\
+Epoch length                 & 256 fills                 & sweep + statistics & tie in speed; low sampling error \\
+Thresholds                   & 75/50/25                  & sweep              & strict is slower, loose is less accurate \\
+High-band degree             & 6                         & sweep              & 4 is worse, 8 is not clearly better \\
+Middle-band degree           & 4                         & sweep (tie)        & kept as chosen \\
+Low-band degree              & 2                         & sweep (tie)        & kept as chosen \\
+Bottom-band degree           & 1                         & design             & degree 0 stops the epoch counter \\
+Stride range, history needed & $-64..63$, 3              & design             & page size, signature length \\
+Signature, PHT size          & 3 strides $\times$ 4 bits, 4096 & inherited    & not tested \\
+PHT confidence limits        & 2-bit, 2 and 3            & design             & chained predictions need more confidence; not tested \\
+Start degree                 & 3                         & design             & used only until the first epoch ends; not tested \\
+\bottomrule
+\end{tabularx}
+\caption{Every value, how it was decided and why.}
+\end{table}
+
+\subsection{Final Choice and Storage}\label{sec:t1-final}
+\code{SPP-Final} combines the two changes the sweep supports, the 8-bit tag and the 32-entry filter. Each was tested
+alone, so we ran the combination as well (Tables~\ref{tab:t1-stages} and~\ref{tab:t1-avg}). Its geometric-mean
+speedup is \textbf{1.01200} against 1.01079 for \code{SPP-AC} ($+0.120\%$), with mean accuracy 54.0\% against 52.6\%
+and mean coverage 8.15\% against 7.92\%. Its per-trace speedups are 1.0098, 1.0133 and 1.0128 (\code{SPP-AC}:
+1.0094, 1.0102, 1.0128).
+
+\subsubsection{Storage Overhead of \code{SPP-Final}}
+We assume 48-bit virtual addresses, so a cache-line address has $48-6 = 42$ bits. Only state needed in hardware is
+counted (statistics counters are not).
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}llr@{}}
+\toprule
+Field & Why this width & Bits \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{IP tracker table, 128 entries}}\\
+Valid             & entry in use                              & 1 \\
+IP tag            & \code{ip \& 0xFF}                         & 8 \\
+Last line address & previous cache line of this IP            & 42 \\
+Last stride       & range $-64 \ldots +63$                    & 7 \\
+Uniform flag      & only compared with 0, so 1 bit is enough  & 1 \\
+Signature         & three 4-bit strides                       & 12 \\
+History count     & 0 to 3                                    & 2 \\
+LRU rank          & rank among 128 entries                    & 7 \\
+\textbf{Entry total} &                                        & \textbf{80} \\
+\textbf{Table total} & $128 \times 80$                        & \textbf{10240} \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Pattern History Table, 4096 entries, indexed by signature (no tag)}}\\
+Predicted stride  & range $-64 \ldots +63$                    & 7 \\
+Confidence        & 2-bit saturating counter (0 = empty)      & 2 \\
+\textbf{Entry total} &                                        & \textbf{9} \\
+\textbf{Table total} & $4096 \times 9$                        & \textbf{36864} \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Prefetch filter, 32 entries, direct-mapped}}\\
+Valid             & line prefetched and not yet used          & 1 \\
+Partial tag       & line address bits above the 5 index bits  & 10 \\
+\textbf{Entry total} &                                        & \textbf{11} \\
+\textbf{Table total} & $32 \times 11$                         & \textbf{352} \\
+\midrule
+\multicolumn{3}{@{}l}{\textit{Control registers}}\\
+Fill counter $F$  & counts to $W = 256$                       & 8 \\
+Useful counter $U$& at most $256 + 32 = 288$                  & 9 \\
+Current degree    & values 1 to 6                             & 3 \\
+\textbf{Total}    &                                           & \textbf{20} \\
+\midrule
+\textbf{Total}    & $10240 + 36864 + 352 + 20$                & \textbf{47476 bits} \\
+                  &                                           & $= 5934.5$ bytes $\approx$ \textbf{5.8\,KiB} \\
+\bottomrule
+\end{tabular}
+\caption{Bit-level storage of \code{SPP-Final}. \code{SPP-AC} (12-bit tag, 64-entry filter) needs 48340 bits, about 5.9\,KiB.}
+\end{table}
+
+\subsection{Final Results}
+IPC, speedup, L1D load MPKI, prefetch accuracy and coverage of the \code{IP-stride} prefetcher and our submitted
+prefetcher \code{SPP-Final}, on the three traces.
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Prefetcher & IPC & Speedup & L1D load MPKI & Accuracy (\%) & Coverage (\%) \\
+\midrule
+\grp{6}{Trace1}
+\code{IP-stride} & 0.2334 & 1.0051 & 10.12 & 52.8 & 5.24 \\
+\code{SPP-Final} & 0.2345 & 1.0098 & 9.68  & 57.8 & 9.37 \\
+\midrule
+\grp{6}{Trace2}
+\code{IP-stride} & 0.2512 & 1.0002 & 13.44 & 38.1 & 0.73 \\
+\code{SPP-Final} & 0.2545 & 1.0133 & 12.94 & 63.3 & 4.40 \\
+\midrule
+\grp{6}{Trace3}
+\code{IP-stride} & 0.3830 & 1.0024 & 3.32  & 16.1 & 2.51 \\
+\code{SPP-Final} & 0.3870 & 1.0128 & 3.04  & 41.0 & 10.69 \\
+\bottomrule
+\end{tabular}
+\caption{IPC, speedup (over no prefetching), L1D load MPKI, prefetch accuracy and coverage of \code{IP-stride} and
+the submitted prefetcher \code{SPP-Final}.}
+\end{table}
+
+\newcommand{\finopts}{cycle list name=final, bar width=9pt, enlarge x limits=0.25}
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tStageIPC}{ips,fin}{\finopts, ymin=0, ymax=0.45, ylabel={IPC},
+    legend entries={IP-stride,SPP-Final}, legend columns=-1, legend to name=leg:final}
+  \caption{IPC}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tStageSpd}{ips,fin}{\finopts, ymin=1, ymax=1.016, ylabel={Speedup}}
+  \caption{Speedup}
+\end{subfigure}\\[4pt]
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tStageMpki}{ips,fin}{\finopts, ymin=0, ymax=15, ylabel={L1D load MPKI}}
+  \caption{L1D load MPKI}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tStageAcc}{ips,fin}{\finopts, ymin=0, ymax=70, ylabel={Accuracy (\%)}}
+  \caption{Prefetch accuracy}
+\end{subfigure}\\[4pt]
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tStageCov}{ips,fin}{\finopts, ymin=0, ymax=12, ylabel={Coverage (\%)}}
+  \caption{Prefetch coverage}
+\end{subfigure}\\[3pt]
+\ref*{leg:final}
+\caption{IPC, speedup, L1D load MPKI, prefetch accuracy and coverage of \code{IP-stride} and \code{SPP-Final} on the three traces.}
+\end{figure}

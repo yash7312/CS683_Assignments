@@ -1,0 +1,97 @@
+% ====================================================================== Tasks 2 and 3: setup
+\clearpage
+\section{Setup and Metrics (Tasks 2 and 3)}
+Tasks 2 and 3 use the same simulator and traces as Task 1. The points below list what is new or different.
+
+\begin{itemize}
+  \item \textbf{System:} ChampSim from the PA2 repository, single core, hashed-perceptron branch predictor.
+        L1I 32\,KB 8-way, L1D 48\,KB 12-way, \textbf{L2C 512\,KB 8-way (1024 sets)}, LLC 2\,MB 16-way.
+        Every cache except the L2C uses LRU. There is no prefetcher unless SPP is named.
+        25M warm-up and 25M simulated instructions on Trace1--Trace3.
+  \item \textbf{Baseline:} every speedup is measured against no prefetcher and LRU at the L2C (the repository
+        default, \code{./build\_champsim.sh no lru}). We also show SRRIP (\code{rrip.l2c\_repl}) because I-RRIP is
+        built on top of it.
+  \item \textbf{Metrics:} IPC = instructions / cycles, and speedup = IPC / IPC$_{\text{baseline}}$. The MPKI values are
+        the ChampSim ROI statistics \code{L2C LOAD MPKI}, \code{L2C INSTRUCTION LOAD MPKI} and \code{L2C DATA LOAD MPKI}
+        (instruction + data = load). L1D accuracy and coverage are defined as in Task 1. When we average over the
+        traces we use the geometric mean for IPC and speedup and the arithmetic mean for everything else.
+  \item \textbf{Interface change (required by Task 2A):} \code{update\_replacement\_state} now takes a ninth argument,
+        \code{uint8\_t isInstruction}. We added it to the function-pointer type and the declarations in
+        \code{inc/cache.h}, to every replacement file, and to all 11 call sites. Each call site passes the
+        \code{instruction} field of the packet that causes the update (the MSHR entry on a fill, the RQ/WQ/PQ entry
+        on a hit). A line counts as an instruction line when \code{isInstruction} is set and the request is a
+        \code{LOAD} or \code{PREFETCH}. This is the same rule \code{fill\_cache()} uses for \code{BLOCK::instruction},
+        and the same rule behind the L2 instruction MPKI statistic.
+  \item \textbf{Two harness fixes} (neither one changes timing):
+        (1) \code{PAGE\_TABLE\_WALKER::handle\_page\_fault()} is declared \code{uint64\_t} but had no \code{return}.
+        GCC\,$\ge$\,8 treats the end of such a function as unreachable, so the unmodified repository built with
+        GCC\,11 crashed after a few thousand instructions. We added \code{return 0;} (no caller uses the value).
+        (2) The single-core path of \code{main.cc} never called \code{l2c\_replacement\_final\_stats()}. We added
+        the call so the policy can print its decision statistics.
+  \item \textbf{Reproducibility:} every configuration in this report is one line in \code{scripts/experiments.sh}.
+        Policy parameters are compile-time macros, and their defaults are the chosen values. For a sweep point,
+        \code{scripts/build.sh} writes a two-line wrapper that \code{\#define}s the macro and \code{\#include}s the policy file.
+  \item \textbf{SPP and compiler:} Task 3 uses the Task 1 prefetcher (\code{prefetcher/spp.l1d\_pref}, \code{SPP-Final})
+        unchanged. Tasks 2 and 3 were compiled with GCC\,11 under WSL, while Task 1 used GCC\,7 in Docker, so the
+        absolute numbers differ slightly. The baseline IPC is 0.2321 / 0.2499 / 0.3820 here and
+        0.2322 / 0.2511 / 0.3821 in Task 1. The speedup of SPP is 1.0083 / 1.0135 / 1.0126 here and
+        1.0098 / 1.0133 / 1.0128 in Task 1. All comparisons inside Tasks 2 and 3 use the same build, so they are
+        consistent with each other.
+\end{itemize}
+
+% ---------------------------------------------------------------- shared data for the Task 2 plots
+% Columns: lru srrip irrip dyn. Last row is the average (geomean for speedup, arithmetic mean for MPKI).
+\pgfplotstableread{
+g       lru    srrip  irrip  dyn
+Trace1  1.0000 0.9996 0.9962 0.9993
+Trace2  1.0000 1.0020 1.0276 1.0268
+Trace3  1.0000 0.9990 1.0050 1.0048
+Average 1.0000 1.0002 1.0095 1.0102
+}\tReplSpd
+\pgfplotstableread{
+g       lru   srrip irrip dyn
+Trace1  17.70 17.61 18.88 17.68
+Trace2  28.64 27.27 23.25 23.33
+Trace3  3.96  4.04  3.90  3.91
+Average 16.77 16.31 15.34 14.97
+}\tReplLoad
+\pgfplotstableread{
+g       lru   srrip irrip dyn
+Trace1  10.37 10.55 9.25  10.54
+Trace2  20.14 19.32 12.33 12.53
+Trace3  1.12  1.20  0.73  0.75
+Average 10.54 10.36 7.44  7.94
+}\tReplInstr
+\pgfplotstableread{
+g       lru   srrip irrip dyn
+Trace1  7.33  7.06  9.63  7.14
+Trace2  8.50  7.95  10.92 10.79
+Trace3  2.84  2.85  3.17  3.16
+Average 6.22  5.95  7.91  7.03
+}\tReplData
+
+% \replfig{columns}{legend entries}{legend name}{bar width}{caption}{label}
+\newcommand{\replfig}[6]{%
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tReplSpd}{#1}{cycle list name=repl, bar width=#4, ymin=0.99, ymax=1.032, ylabel={Speedup over LRU}, speedline,
+    legend entries={#2}, legend columns=-1, legend to name=#3}
+  \caption{Speedup over LRU}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tReplLoad}{#1}{cycle list name=repl, bar width=#4, ymin=0, ymax=30, ylabel={L2C load MPKI}}
+  \caption{L2C load MPKI}
+\end{subfigure}\\[4pt]
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tReplInstr}{#1}{cycle list name=repl, bar width=#4, ymin=0, ymax=22, ylabel={L2 instr.\ load MPKI}}
+  \caption{L2 instruction load MPKI}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}\centering
+  \gbarplot{\tReplData}{#1}{cycle list name=repl, bar width=#4, ymin=0, ymax=12, ylabel={L2 data load MPKI}}
+  \caption{L2 data load MPKI}
+\end{subfigure}\\[3pt]
+\ref*{#3}
+\caption{#5}
+\label{#6}
+\end{figure}}

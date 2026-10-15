@@ -75,35 +75,19 @@ sudo update-alternatives --config g++
 sudo update-alternatives --config gcc
 ```
 
-## PA2 Tasks 2 and 3: what was added
+## PA2 Tasks 2 and 3: Below are the set of changes we made for TASK 2 and 3.
 
 | File | Purpose |
 |------|---------|
 | `replacement/irrip.l2c_repl` | Task 2A: instruction-conscious RRIP (I-RRIP) at the L2C |
 | `replacement/dyn_irrip.l2c_repl` | Task 2B: set-dueling dynamic I-RRIP; Task 3: prefetch awareness (`DYN_PF_AWARE`) |
 | `inc/cache.h`, `src/cache.cc`, `src/ooo_cpu.cc`, `replacement/*` | `update_replacement_state(..., uint8_t isInstruction)`: every call site passes the packet's `instruction` flag |
-| `src/page_table_walker.cc` | `handle_page_fault()` returned no value; with GCC >= 8 this makes the `-O3` binary crash, so `return 0;` was added (callers ignore the value) |
+| `src/page_table_walker.cc` | This file gave error on GCC >=8, so we added a return value in `handle_page_fault()` which prevents the `-O3` binary from crashing, so `return 0;` was added |
 | `src/main.cc` | the single-core path now also calls `l2c_replacement_final_stats()` |
-| `scripts/` | build/run/parse/report scripts (below) |
-| `results/task2_3/` | raw ChampSim output of every Task 2/3 run and `summary.csv` (Task 1 results stay in `results/`) |
-| `Summary.pdf` | report for all tasks |
 
 Every policy parameter is a compile-time macro with the chosen value as default.
-`scripts/build.sh` builds a parameter variant without editing the policy file:
+`scripts/build.sh` builds a parameter variant :
 
 ```bash
 scripts/build.sh dyn_irrip_T40 no dyn_irrip DYN_THRESHOLD_PCT=40   # -> bin/dyn_irrip_T40
 ```
-
-Reproduce all results (Linux / WSL; traces named `trace1.champsimtrace.gz` ... in `<trace_dir>`):
-
-```bash
-scripts/experiments.sh build
-JOBS=16 scripts/experiments.sh run <trace_dir> results/task2_3
-python3 scripts/parse_results.py results/task2_3 results/task2_3/summary.csv
-python3 scripts/make_report.py results/task2_3/summary.csv report
-python scripts/build_pdf.py <task1_report.pdf> report/tasks23.html Summary.pdf   # Windows: Edge/Chrome + pypdf
-```
-
-`scripts/sync_wsl.sh` copies the repository into a Linux directory and strips CRLF line endings (needed when the
-repository is checked out on Windows and built under WSL).

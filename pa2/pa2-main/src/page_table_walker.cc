@@ -422,8 +422,7 @@ uint64_t PAGE_TABLE_WALKER::handle_page_fault(PAGE_TABLE_PAGE* page, PACKET *pac
     else
         stall_cycle[cpu] = current_core_cycle[cpu] + PAGE_TABLE_LATENCY;
 
-    // callers ignore the return value; without a return statement GCC >= 8
-    // treats the end of this function as unreachable and the -O3 binary crashes
+    // Added for GCC >= 8, so binary not crashes with -o3 flag. 
     return 0;
 }
 

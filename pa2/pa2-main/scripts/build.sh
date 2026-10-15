@@ -1,11 +1,7 @@
 #!/bin/bash
 # Build one ChampSim configuration and store it as bin/<tag>.
-#
-#   scripts/build.sh <tag> <l1d_prefetcher> <l2c_replacement> [MACRO=VALUE ...]
-#
-# Extra MACRO=VALUE arguments create a parameter variant of the replacement
-# policy: a temporary replacement/_<tag>.l2c_repl that #defines the macros
-# and #includes the real policy file.
+# scripts/build.sh <tag> <l1d_prefetcher> <l2c_replacement> [MACRO=VALUE ...]
+
 set -e
 tag=$1; pref=$2; repl=$3; shift 3
 cd "$(dirname "$0")/.."

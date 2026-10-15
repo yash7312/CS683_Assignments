@@ -1,0 +1,259 @@
+% ====================================================================== Task 2B
+\clearpage
+\section{Task 2B: Dynamic I-RRIP}
+I-RRIP helps Trace2 and Trace3 but hurts Trace1. Dynamic I-RRIP (\code{replacement/dyn\_irrip.l2c\_repl}) chooses
+between SRRIP and I-RRIP while the program runs.
+
+\subsection{Design}
+The policy uses \textbf{set dueling}. A few \textbf{leader sets always run SRRIP} and, in the final design, the same
+number of leader sets always run I-RRIP. All other sets (the followers) use whichever policy is currently winning.
+Leader sets are placed by complement-select: the 1024 sets are split into $N$ groups of $1024/N$ sets, and in group
+$k$ the set at offset $k$ is an SRRIP leader and the set at offset $1024/N-1-k$ is an I-RRIP leader. This spreads
+the leaders over the whole index range, so they do not line up with power-of-two strides of the program.
+
+The leader sets count instruction and data (non-instruction) \textbf{demand} accesses and misses; writebacks are not
+counted. We implemented two decision rules (\code{DYN\_MODE}):
+\begin{itemize}
+  \item \textbf{Mode 0: the formula from the hint.} In the SRRIP leaders,
+        ratio = (instr.\ accesses + instr.\ misses) / (total accesses + total misses).
+        Every \code{DYN\_EPOCH} = 1024 leader accesses, the followers use I-RRIP if ratio $> T$. The four counters are
+        then halved so that old program phases fade out. We measure the ratio in the SRRIP sets on purpose: in the
+        I-RRIP sets, the policy we are judging would already have removed instruction misses and biased the measurement.
+  \item \textbf{Mode 1: miss duel (submitted).} A 10-bit saturating counter PSEL starts at 512. A demand miss in an
+        SRRIP leader adds its weight to PSEL, and a miss in an I-RRIP leader subtracts it. A data miss weighs 1 and an
+        instruction miss weighs $\boldsymbol{W = 2}$. Every 1024 SRRIP-leader accesses, the followers use I-RRIP if
+        PSEL $\ge 512$, i.e.\ if the I-RRIP leaders produced fewer weighted misses.
+\end{itemize}
+
+\subsection{The formula from the hint: threshold sensitivity}
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Threshold & \makecell{Speedup\\Trace1} & \makecell{Speedup\\Trace2} & \makecell{Speedup\\Trace3} & \makecell{Geomean\\speedup}
+          & \makecell{Fraction I-RRIP\\(T1/T2/T3)} & \makecell{Mean ratio\\(T1/T2/T3)} \\
+\midrule
+$T = 5\%$  & 0.9962 & 1.0265 & 1.0048 & 1.0091 & 1.00 / 1.00 / 1.00 & 0.44 / 0.61 / 0.31 \\
+$T = 10\%$ & 0.9962 & 1.0231 & 1.0047 & 1.0079 & 1.00 / 0.98 / 1.00 & 0.44 / 0.61 / 0.31 \\
+$T = 15\%$ & 0.9962 & 1.0230 & 1.0045 & 1.0079 & 1.00 / 0.98 / 0.86 & 0.44 / 0.61 / 0.31 \\
+$T = 20\%$ & 0.9960 & 1.0226 & 0.9994 & 1.0059 & 1.00 / 0.96 / 0.57 & 0.44 / 0.61 / 0.31 \\
+$T = 25\%$ & 0.9960 & 1.0226 & 0.9985 & 1.0056 & 1.00 / 0.96 / 0.43 & 0.44 / 0.61 / 0.31 \\
+$T = 30\%$ & 0.9958 & 1.0219 & 0.9986 & 1.0053 & 1.00 / 0.94 / 0.43 & 0.44 / 0.61 / 0.31 \\
+$T = 40\%$ & 0.9964 & 1.0218 & 0.9987 & 1.0056 & 0.85 / 0.92 / 0.29 & 0.44 / 0.61 / 0.31 \\
+$T = 50\%$ & 0.9992 & 1.0211 & 0.9989 & 1.0063 & 0.04 / 0.90 / 0.29 & 0.44 / 0.61 / 0.31 \\
+$T = 60\%$ & 0.9985 & 1.0182 & 0.9990 & 1.0052 & 0.00 / 0.82 / 0.00 & 0.45 / 0.61 / 0.31 \\
+$T = 70\%$ & 0.9985 & 1.0027 & 0.9990 & 1.0001 & 0.00 / 0.00 / 0.00 & 0.45 / 0.61 / 0.31 \\
+\bottomrule
+\end{tabular}
+\caption{Mode 0 (formula from the hint) with 10 thresholds; 32 SRRIP leader sets, epoch 1024. ``Fraction I-RRIP'' is
+the share of ROI decisions that chose I-RRIP, ``mean ratio'' the average measured ratio.}
+\label{tab:t2b-thr}
+\end{table}
+
+\pgfplotstableread{
+T  t1     t2     t3     gm     f1   f2   f3
+5  0.9962 1.0265 1.0048 1.0091 1.00 1.00 1.00
+10 0.9962 1.0231 1.0047 1.0079 1.00 0.98 1.00
+15 0.9962 1.0230 1.0045 1.0079 1.00 0.98 0.86
+20 0.9960 1.0226 0.9994 1.0059 1.00 0.96 0.57
+25 0.9960 1.0226 0.9985 1.0056 1.00 0.96 0.43
+30 0.9958 1.0219 0.9986 1.0053 1.00 0.94 0.43
+40 0.9964 1.0218 0.9987 1.0056 0.85 0.92 0.29
+50 0.9992 1.0211 0.9989 1.0063 0.04 0.90 0.29
+60 0.9985 1.0182 0.9990 1.0052 0.00 0.82 0.00
+70 0.9985 1.0027 0.9990 1.0001 0.00 0.00 0.00
+}\tThr
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.49\textwidth}\centering
+  \lineplot{\tThr}{T}{t1,t2,t3,gm}{xlabel={Threshold $T$ (\%)}, ylabel={Speedup over LRU}, xtick={5,10,...,30,40,50,60,70},
+    ymin=0.994, ymax=1.03, speedline,
+    legend entries={Trace1,Trace2,Trace3,Geomean}, legend columns=-1, legend to name=leg:thr}
+  \caption{Speedup}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}\centering
+  \lineplot{\tThr}{T}{f1,f2,f3}{xlabel={Threshold $T$ (\%)}, ylabel={Fraction of decisions = I-RRIP},
+    xtick={5,10,...,30,40,50,60,70}, ymin=-0.05, ymax=1.05,
+    yticklabel style={/pgf/number format/.cd, fixed, fixed zerofill, precision=1}}
+  \caption{Share of decisions that chose I-RRIP}
+\end{subfigure}\\[3pt]
+\ref*{leg:thr}
+\caption{Mode 0: sensitivity to the threshold $T$.}
+\label{fig:t2b-thr}
+\end{figure}
+
+The measured ratio hardly changes within a trace: about 0.44 on Trace1, 0.61 on Trace2 and 0.31 on Trace3.
+Low thresholds ($T \le 15\%$) almost always choose I-RRIP and match static I-RRIP; $T = 70\%$ never chooses it and
+equals SRRIP. In between, the traces switch to SRRIP in the order of their ratios: Trace3 first, then Trace1, then Trace2.
+
+That order is the problem. \textbf{Trace3 gains from I-RRIP} ($+0.50\%$) even though only about 31\% of its leader
+traffic is instruction traffic, and \textbf{Trace1 loses} ($-0.38\%$) even though 44\% is. A threshold between the two
+ratios ($T$ = 30--40\%) gives Trace3 SRRIP and Trace1 I-RRIP, which is exactly backwards. $T = 50\%$ gets Trace1 right
+but still takes I-RRIP away from Trace3. The best threshold is the lowest one ($T = 5\%$, $+0.91\%$), so the formula
+works best when it does nothing.
+
+The reason is that the ratio tells us \emph{how much} of the L2 traffic is instruction traffic, not \emph{whether}
+protecting it pays off. That depends on what the protection costs. On Trace1 the data has L2 reuse, and moving data
+insertion to RRPV 3 adds 2.57 data MPKI while removing only 1.30 instruction MPKI. To decide correctly, the policy has
+to measure the effect of I-RRIP itself, and that is what set dueling against I-RRIP leader sets does.
+
+\subsection{Miss duel: weight, leader sets and epoch}
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Instr.\ miss weight & \makecell{Speedup\\Trace1} & \makecell{Speedup\\Trace2} & \makecell{Speedup\\Trace3}
+                    & \makecell{Geomean\\speedup} & \makecell{Fraction I-RRIP\\(T1/T2/T3)} \\
+\midrule
+$W = 1$         & 0.9993 & 1.0268 & 0.9994 & 1.0084 & 0.00 / 1.00 / 0.00 \\
+$W = 1.5$       & 0.9993 & 1.0267 & 1.0012 & 1.0090 & 0.00 / 1.00 / 0.86 \\
+\chosen{$W = 2$}& 0.9993 & 1.0268 & 1.0048 & 1.0102 & 0.00 / 1.00 / 1.00 \\
+$W = 3$         & 0.9991 & 1.0267 & 1.0048 & 1.0101 & 0.04 / 1.00 / 1.00 \\
+$W = 4$         & 0.9965 & 1.0267 & 1.0048 & 1.0092 & 0.88 / 1.00 / 1.00 \\
+$W = 8$         & 0.9962 & 1.0267 & 1.0048 & 1.0092 & 1.00 / 1.00 / 1.00 \\
+\bottomrule
+\end{tabular}
+\caption{Mode 1 with six instruction-miss weights $W$ (a data miss weighs 1; $W = 1.5$ is implemented as steps of 3
+and 2), 32 + 32 leader sets, epoch 1024. Highlighted: submitted.}
+\label{tab:t2b-w}
+\end{table}
+
+\pgfplotstableread{
+W   t1     t2     t3     gm     f1   f2   f3
+1   0.9993 1.0268 0.9994 1.0084 0.00 1.00 0.00
+1.5 0.9993 1.0267 1.0012 1.0090 0.00 1.00 0.86
+2   0.9993 1.0268 1.0048 1.0102 0.00 1.00 1.00
+3   0.9991 1.0267 1.0048 1.0101 0.04 1.00 1.00
+4   0.9965 1.0267 1.0048 1.0092 0.88 1.00 1.00
+8   0.9962 1.0267 1.0048 1.0092 1.00 1.00 1.00
+}\tW
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.49\textwidth}\centering
+  \lineplot{\tW}{W}{t1,t2,t3,gm}{xlabel={Instruction-miss weight $W$}, ylabel={Speedup over LRU}, xtick={1,1.5,2,3,4,8},
+    xticklabel style={/pgf/number format/.cd, fixed}, ymin=0.994, ymax=1.03, speedline,
+    legend entries={Trace1,Trace2,Trace3,Geomean}, legend columns=-1, legend to name=leg:w}
+  \caption{Speedup}
+\end{subfigure}\hfill
+\begin{subfigure}{0.49\textwidth}\centering
+  \lineplot{\tW}{W}{f1,f2,f3}{xlabel={Instruction-miss weight $W$}, ylabel={Fraction of decisions = I-RRIP},
+    xtick={1,1.5,2,3,4,8}, xticklabel style={/pgf/number format/.cd, fixed}, ymin=-0.05, ymax=1.05,
+    yticklabel style={/pgf/number format/.cd, fixed, fixed zerofill, precision=1}}
+  \caption{Share of decisions that chose I-RRIP}
+\end{subfigure}\\[3pt]
+\ref*{leg:w}
+\caption{Mode 1: sensitivity to the instruction-miss weight $W$.}
+\label{fig:t2b-w}
+\end{figure}
+
+\newcommand{\cell}[2]{\makecell{#1\\[-1pt]{\scriptsize\color{ink2}#2}}}
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Weight & 16 + 16 leader sets & 32 + 32 leader sets & 64 + 64 leader sets \\
+\midrule
+$W = 1$   & \cell{1.0104}{0.00 / 1.00 / 1.00 \cmark} & \cell{1.0084}{0.00 / 1.00 / 0.00} & \cell{1.0095}{1.00 / 1.00 / 1.00} \\
+$W = 1.5$ & \cell{1.0104}{0.00 / 0.96 / 1.00 \cmark} & \cell{1.0090}{0.00 / 1.00 / 0.86 \cmark} & \cell{1.0095}{1.00 / 1.00 / 1.00} \\
+$W = 2$   & \cell{1.0093}{0.93 / 1.00 / 1.00} & \cellcolor{hl}\cell{\textbf{1.0102}}{0.00 / 1.00 / 1.00 \cmark} & \cell{1.0095}{1.00 / 1.00 / 1.00} \\
+\bottomrule
+\end{tabular}
+\caption{Geometric-mean speedup for every combination of weight and number of leader sets, with the share of decisions
+that chose I-RRIP on Trace1 / Trace2 / Trace3 (\cmark: SRRIP on Trace1 and I-RRIP on Trace2 and Trace3, the best
+static choice per trace). Highlighted: submitted.}
+\label{tab:t2b-grid}
+\end{table}
+
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+\makecell[l]{Variant (mode 1, $W = 2$,\\32 + 32 leaders unless stated)} & \makecell{Speedup\\Trace1} & \makecell{Speedup\\Trace2}
+  & \makecell{Speedup\\Trace3} & \makecell{Geomean\\speedup} & \makecell{Fraction I-RRIP\\(T1/T2/T3)} \\
+\midrule
+epoch 256                       & 0.9986 & 1.0268 & 1.0048 & 1.0100 & 0.00 / 1.00 / 1.00 \\
+\chosen{epoch 1024 (submitted)} & 0.9993 & 1.0268 & 1.0048 & 1.0102 & 0.00 / 1.00 / 1.00 \\
+epoch 4096                      & 0.9993 & 1.0267 & 1.0048 & 1.0102 & 0.00 / 1.00 / 1.00 \\
+\midrule
+$W = 1$, epoch 256              & 0.9986 & 1.0268 & 0.9994 & 1.0082 & 0.00 / 1.00 / 0.00 \\
+$W = 1$, epoch 1024             & 0.9993 & 1.0268 & 0.9994 & 1.0084 & 0.00 / 1.00 / 0.00 \\
+$W = 1$, epoch 4096             & 0.9993 & 1.0268 & 0.9994 & 1.0084 & 0.00 / 1.00 / 0.00 \\
+\midrule
+mode 0, $T = 25\%$, epoch 256   & 0.9957 & 1.0229 & 0.9986 & 1.0057 & 1.00 / 0.95 / 0.36 \\
+mode 0, $T = 25\%$, epoch 1024  & 0.9960 & 1.0226 & 0.9985 & 1.0056 & 1.00 / 0.96 / 0.43 \\
+mode 0, $T = 25\%$, epoch 4096  & 0.9962 & 1.0265 & 1.0048 & 1.0091 & 1.00 / 1.00 / 1.00 \\
+\bottomrule
+\end{tabular}
+\caption{Epoch length: the followers re-read the decision every \emph{epoch} SRRIP-leader accesses.}
+\label{tab:t2b-epoch}
+\end{table}
+
+\textbf{Weight.} With $W = 1$ (a plain miss count) and 32 + 32 leaders, the duel correctly picks SRRIP for Trace1 and
+I-RRIP for Trace2, but it also picks SRRIP for Trace3, where the two policies differ by only a few misses. $W = 2$
+picks I-RRIP for Trace3 as well and gives $+1.02\%$. $W = 3$ is a tie ($+1.01\%$), while $W = 4$ and 8 give
+instruction misses too much weight and send Trace1 back to I-RRIP. $W = 2$ also has a physical meaning: an
+instruction miss stalls fetch, while the core can overlap part of a data miss with other work, so an instruction miss
+costs roughly twice as much.
+
+\textbf{Leader sets and weight together (Table~\ref{tab:t2b-grid}).} The leaders are only a sample of the cache, and
+on Trace1 and Trace3 the two policies are close. On Trace1, I-RRIP adds about 2.5 data MPKI and removes about 1.2
+instruction MPKI, so with $W = 2$ the weighted misses of the two leader groups are almost equal. The winner then depends
+on which sets happen to be sampled, which is why neighbouring cells of the grid disagree on Trace1 or Trace3. Three
+settings choose the best policy on every trace (\cmark): 16 + 16 leaders with $W = 1$ or 1.5, and 32 + 32 leaders with
+$W = 2$. They are within 0.02\% of each other, a tie. We submit \textbf{32 + 32 leaders with $\boldsymbol{W = 2}$}:
+32 leader sets per policy (6.25\% of the 1024 sets together) is the size DIP uses for caches of this size, and it
+halves the sampling noise of 16 sets (the standard error of a sampled miss rate falls with the square root of the
+number of sets). 64 + 64 leaders run 12.5\% of the cache with a fixed policy, and in our runs they also chose I-RRIP
+for Trace1. A wrong choice is cheap on these traces anyway: the worst cell of the grid is $+0.84\%$, still better
+than SRRIP ($+0.02\%$) and close to static I-RRIP ($+0.95\%$), because the duel is only unsure where the two policies
+are close.
+
+\textbf{Epoch (Table~\ref{tab:t2b-epoch}).} PSEL is updated all the time; the epoch only sets how often the followers
+read it. Trace3 sends few requests to the L2, so with an epoch of 1024 it makes only 7 decisions in 25M instructions.
+That is still enough, because its preference never changes. For the duel, all three epochs give the same decisions
+(within 0.02\%). For mode 0 the epoch changes which phases are sampled, but no epoch makes the formula choose the
+right policies.
+
+\subsection{Results}
+\begin{table}[H]\centering\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Configuration & IPC & Speedup & L2C load MPKI & L2 instr.\ load MPKI & L2 data load MPKI \\
+\midrule
+\grp{6}{Trace1}
+LRU (baseline)      & 0.2321 & 1.0000 & 17.70 & 10.37 & 7.33 \\
+SRRIP               & 0.2320 & 0.9996 & 17.61 & 10.55 & 7.06 \\
+I-RRIP              & 0.2312 & 0.9962 & 18.88 & 9.25  & 9.63 \\
+\chosen{Dyn-I-RRIP} & 0.2320 & 0.9993 & 17.68 & 10.54 & 7.14 \\
+\midrule
+\grp{6}{Trace2}
+LRU (baseline)      & 0.2499 & 1.0000 & 28.64 & 20.14 & 8.50 \\
+SRRIP               & 0.2504 & 1.0020 & 27.27 & 19.32 & 7.95 \\
+I-RRIP              & 0.2568 & 1.0276 & 23.25 & 12.33 & 10.92 \\
+\chosen{Dyn-I-RRIP} & 0.2566 & 1.0268 & 23.33 & 12.53 & 10.79 \\
+\midrule
+\grp{6}{Trace3}
+LRU (baseline)      & 0.3820 & 1.0000 & 3.96 & 1.12 & 2.84 \\
+SRRIP               & 0.3816 & 0.9990 & 4.04 & 1.20 & 2.85 \\
+I-RRIP              & 0.3839 & 1.0050 & 3.90 & 0.73 & 3.17 \\
+\chosen{Dyn-I-RRIP} & 0.3838 & 1.0048 & 3.91 & 0.75 & 3.16 \\
+\midrule
+\grp{6}{Average (geometric mean for IPC and speedup, arithmetic mean otherwise)}
+LRU (baseline)      & 0.2809 & 1.0000 & 16.77 & 10.54 & 6.22 \\
+SRRIP               & 0.2809 & 1.0002 & 16.31 & 10.36 & 5.95 \\
+I-RRIP              & 0.2836 & 1.0095 & 15.34 & 7.44  & 7.91 \\
+\chosen{Dyn-I-RRIP} & 0.2838 & 1.0102 & 14.97 & 7.94  & 7.03 \\
+\bottomrule
+\end{tabular}
+\caption{Task 2B: IPC, speedup over LRU and L2 load MPKIs (no prefetcher). Dyn-I-RRIP = mode 1, $W = 2$,
+32 + 32 leaders, epoch 1024.}
+\label{tab:t2b-res}
+\end{table}
+
+\replfig{lru,srrip,irrip,dyn}{LRU (baseline),SRRIP,I-RRIP,Dyn-I-RRIP}{leg:t2b}{4pt}
+  {Task 2B: speedup and L2C / L2 instruction / L2 data load MPKI.}{fig:t2b-res}
+
+Dynamic I-RRIP keeps the gains of I-RRIP where they exist (Trace2 $+2.68\%$, Trace3 $+0.48\%$) and falls back to SRRIP
+on Trace1 ($-0.07\%$ instead of $-0.38\%$ with static I-RRIP). As a result it beats both SRRIP and I-RRIP in geometric
+mean ($+1.02\%$ vs $+0.02\%$ and $+0.95\%$), and Trace1's data load MPKI goes back to the SRRIP level (7.14).
+
+\textbf{Storage.} On top of SRRIP (2-bit RRPV per line, 16384 bits), the policy needs the instruction bit per line
+(8192 bits), a 10-bit PSEL, a 10-bit epoch counter and the 1-bit follower mode: 8213 bits $\approx$ 1.0\,KiB in total.
+Leader sets are recognised by comparing two 5-bit fields of the set index, so no table is needed. (Mode 0 would need
+four 16-bit counters, 64 bits, instead of PSEL.)
