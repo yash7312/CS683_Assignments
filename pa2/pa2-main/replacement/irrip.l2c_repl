@@ -1,21 +1,5 @@
 #include "cache.h"
 
-// ---------------------------------------------------------------------------
-// Instruction-conscious RRIP (I-RRIP) for the L2C
-//
-// 2-bit RRPV per line, as in SRRIP. Instruction lines are preferred over data
-// lines in all three parts of the policy:
-//   insertion : instruction lines enter near (RRPV IRRIP_INS_INSTR), data
-//               lines enter distant (RRPV IRRIP_INS_DATA)
-//   promotion : an instruction hit goes to RRPV 0; a data hit only moves one
-//               step closer (IRRIP_DATA_PROMO_STEP); writeback hits do not
-//               promote (they are not a reuse by the core)
-//   eviction  : among the lines at maxRRPV, a data line is chosen before an
-//               instruction line
-// The knobs below are the values chosen in the Task 2A ablation study; each
-// one can be overridden with a #define before including this file.
-// ---------------------------------------------------------------------------
-
 #define maxRRPV 3
 
 #ifndef IRRIP_INS_INSTR

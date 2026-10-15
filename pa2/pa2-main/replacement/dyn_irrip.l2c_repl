@@ -1,36 +1,5 @@
 #include "cache.h"
 
-// ---------------------------------------------------------------------------
-// Dynamic I-RRIP for the L2C (Task 2B) with prefetch awareness (Task 3)
-//
-// Set dueling: DYN_LEADERS leader sets always run plain SRRIP. In these sets
-// we count instruction and total demand accesses and misses. Every
-// DYN_EPOCH leader accesses the follower sets choose their policy:
-//
-//      ratio = (instr accesses + instr misses) / (total accesses + total misses)
-//      ratio > DYN_THRESHOLD  ->  followers use I-RRIP, else SRRIP
-//
-// and the counters are halved, so old phases fade out. The ratio is measured
-// in SRRIP sets only: in I-RRIP sets the instruction misses would already be
-// reduced by the policy we are deciding about, which would bias the decision.
-//
-// DYN_MODE 1 replaces the ratio with a classic PSEL duel between SRRIP
-// leaders and I-RRIP leaders; an instruction miss moves PSEL by
-// DYN_INSTR_MISS_WEIGHT, a data miss by DYN_DATA_MISS_WEIGHT.
-//
-// Prefetch awareness (DYN_PF_AWARE, Task 3):
-//   * a prefetch fill of a data line is inserted at distant RRPV (DYN_PF_INS)
-//   * a prefetch request that hits does not promote the line
-//   * the first demand hit on a prefetched line promotes it only to
-//     DYN_PF_USE_RRPV, later hits promote as usual
-//   * victim choice among maxRRPV lines: unused prefetched data, then other
-//     data, then instruction lines
-//   * prefetch requests are not counted in the leader-set ratio, so prefetch
-//     traffic cannot dilute the instruction share and switch I-RRIP off
-// With no prefetcher, none of these paths is taken and the policy is exactly
-// the Task 2B policy.
-// ---------------------------------------------------------------------------
-
 #define maxRRPV 3
 
 // ---- I-RRIP rules (the values chosen in Task 2A) ----
